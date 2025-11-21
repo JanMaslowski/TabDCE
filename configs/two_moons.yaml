@@ -1,0 +1,24 @@
+project_name: "twomoons_diffusion"
+
+dataset:
+  name: "twomoons"
+  n_samples: 2000
+  noise: 0.1
+  k_neighbors: 15
+  search_method: "dpp"
+
+diffusion:
+  T: 200               # Liczba kroków dyfuzji
+  schedule: "cosine"
+
+model:
+  hidden_dim: 128
+  depth: 3
+  dropout: 0.0
+
+train:
+  batch_size: 32
+  lr: 0.001
+  epochs: 2000
+  device: "cpu"       # lub "cpu"
+  output_dir: "checkpoints"
