@@ -8,6 +8,13 @@ ENV/
 
 wandb/
 checkpoints/
+notebooks/
 
 .DS_Store
 .env
+
+*.pt
+checkpoints_const/
+
+data/
+*.csv
