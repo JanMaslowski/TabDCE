@@ -1,0 +1,46 @@
+project_name: "tabdce-diffusion" 
+run_name: "adult-run_knn_svdd_small_v2_with_dist_spars_cat"
+
+dataset:
+  name: "adult"
+  data_dir: "data/adult"  
+  n_samples: 3000
+  noise: 0.1
+  k_neighbors: 50
+  search_method: "knn"
+  scaler: "standard"  #"quantile" , "standard"
+
+classifier:
+  train: true           
+  relabel: true         
+  hidden_layers: [30, 30] 
+  lr: 0.001
+  epochs: 100
+  batch_size: 64
+
+diffusion:
+  T: 200
+  schedule: "cosine"
+
+model:
+  hidden_dim: 256
+  depth: 3
+  dropout: 0.0
+
+train:
+  batch_size: 32
+  lr: 0.001
+  epochs: 250
+  device: "cuda"
+  output_dir: "checkpoints_const"
+
+svdd:
+  n_candidates: 50
+  guidance_scale: 20.0
+  dist_scale: 0.1
+  cat_scale: 0.0
+  temperature: 2.0
+
+eval:
+  n_test_samples: 1000
+  n_cf_per_sample: 10

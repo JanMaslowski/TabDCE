@@ -1,0 +1,39 @@
+project_name: "tabdce-diffusion"
+run_name: "gmc-run_dpp"
+
+dataset:
+  name: "gmc"
+  data_dir: "data/gmc"  
+  n_samples: 10000
+  noise: 0.1
+  k_neighbors: 50
+  search_method: "dpp"
+  scaler: "standard" 
+
+classifier:
+  train: true           
+  relabel: true         
+  hidden_layers: [30, 30] 
+  lr: 0.001
+  epochs: 100
+  batch_size: 64
+
+diffusion:
+  T: 200
+  schedule: "cosine"
+
+model:
+  hidden_dim: 256
+  depth: 3
+  dropout: 0.0
+
+train:
+  batch_size: 32
+  lr: 0.001
+  epochs: 2500
+  device: "cuda"
+  output_dir: "checkpoints_const"
+
+eval:
+  n_test_samples: 1000
+  n_cf_per_sample: 10
