@@ -1,10 +1,10 @@
 project_name: "tabdce-diffusion" 
-run_name: "adult-run_knn_svdd_small_v2_with_dist_spars_cat"
+run_name: "adult-TabSyn-dpp"
 
 dataset:
   name: "adult"
   data_dir: "data/adult"  
-  n_samples: 3000
+  n_samples: 5000
   noise: 0.1
   k_neighbors: 50
   search_method: "knn"
@@ -13,24 +13,32 @@ dataset:
 classifier:
   train: true           
   relabel: true         
-  hidden_layers: [30, 30] 
+  hidden_layers: [64, 32] 
   lr: 0.001
   epochs: 100
   batch_size: 64
 
 diffusion:
-  T: 200
+  T: 50
   schedule: "cosine"
 
+vae:
+  latent_dim: 64 
+  hidden_dims: [256, 128]
+  lr: 0.0001
+  epochs: 1000
+  vae_path: "checkpoints/adult_vae_trans_large.pt"       # Skąd ma próbować wczytać
+  vae_save_path: "checkpoints/adult_vae_trans_large.pt"  
+
 model:
-  hidden_dim: 256
-  depth: 3
+  hidden_dim: 2512
+  depth: 5
   dropout: 0.0
 
 train:
   batch_size: 32
-  lr: 0.001
-  epochs: 250
+  lr: 0.0001
+  epochs: 1000
   device: "cuda"
   output_dir: "checkpoints_const"
 
@@ -42,5 +50,5 @@ svdd:
   temperature: 2.0
 
 eval:
-  n_test_samples: 1000
+  n_test_samples: 500
   n_cf_per_sample: 10

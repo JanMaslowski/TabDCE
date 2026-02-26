@@ -1,25 +1,54 @@
-project_name: "twomoons_diffusion"
+project_name: "tabdce-diffusion" 
+run_name: "two-moons-TabSyn-dpp"
 
 dataset:
-  name: "twomoons"
-  n_samples: 1000
+  name: "two_moons"
+  data_dir: "data/two_moons"  
+  n_samples: 500
   noise: 0.1
-  k_neighbors: 15
-  search_method: "dpp"
-  scaler: "standard" 
+  k_neighbors: 50
+  search_method: "knn"
+  scaler: "standard"  #"quantile" , "standard"
+
+classifier:
+  train: true           
+  relabel: true         
+  hidden_layers: [64, 32] 
+  lr: 0.001
+  epochs: 100
+  batch_size: 64
 
 diffusion:
-  T: 200              
+  T: 50
   schedule: "cosine"
 
+vae:
+  latent_dim: 64 
+  hidden_dims: [256, 128]
+  lr: 0.0001
+  epochs: 400
+  vae_path: "checkpoints/two_moons_vae_transform.pt"       # Skąd ma próbować wczytać
+  vae_save_path: "checkpoints/two_moons_vae_transform.pt"
+
 model:
-  hidden_dim: 128
+  hidden_dim: 256
   depth: 3
   dropout: 0.0
 
 train:
-  batch_size: 32
+  batch_size: 8
   lr: 0.001
-  epochs: 2000
-  device: "cpu"
+  epochs: 700
+  device: "cuda"
   output_dir: "checkpoints_const"
+
+svdd:
+  n_candidates: 50
+  guidance_scale: 20.0
+  dist_scale: 0.1
+  cat_scale: 0.0
+  temperature: 2.0
+
+eval:
+  n_test_samples: 200
+  n_cf_per_sample: 10

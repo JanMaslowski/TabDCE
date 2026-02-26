@@ -12,6 +12,7 @@ from sklearn.preprocessing import QuantileTransformer, OneHotEncoder, StandardSc
 class TabularSpec:
     num_idx: List[int]
     cat_idx: List[int]
+    target_col: str = None 
     cat_cardinalities: List[int] = None
 
 
@@ -28,8 +29,10 @@ class TabularCounterfactualDataset(Dataset):
         dtype: torch.dtype = torch.float32,
         scaler_type="quantile",
         ohe: OneHotEncoder | None = None,
+        scaler: object | None = None,
         build_neighbors: bool = True,
         gower_weight: float = 1.0,
+        data_dir: str = ""
     ) -> None:
         super().__init__()
 
@@ -41,6 +44,7 @@ class TabularCounterfactualDataset(Dataset):
         self.dpp_pool_factor = dpp_pool_factor
         self.scaler_type = scaler_type
         self.gower_weight = gower_weight
+        self.data_dir = data_dir
 
         if isinstance(y, torch.Tensor):
             self.y = y.long().to(self.device)
@@ -50,7 +54,6 @@ class TabularCounterfactualDataset(Dataset):
         self.num_classes_target = len(torch.unique(self.y))
         X_np = X.cpu().numpy() if isinstance(X, torch.Tensor) else X
         N = X_np.shape[0]
-
         if len(spec.num_idx) > 0:
             X_num_np = X_np[:, spec.num_idx].astype(np.float32)
         else:
@@ -62,27 +65,34 @@ class TabularCounterfactualDataset(Dataset):
             X_cat_np = np.zeros((N, 0))
 
         self.num_numerical = X_num_np.shape[1]
-        if self.scaler_type == "standard":
-            self.scaler = StandardScaler()
-            print("Using StandardScaler for numerical data.")
-        else:
-            self.scaler = QuantileTransformer(output_distribution='normal')
-            print("Using QuantileTransformer for numerical data.")
-
-        
         if self.num_numerical > 0:
-            X_num_tr = self.scaler.fit_transform(X_num_np)
+            if scaler is not None:
+                print("Using provided scaler (transform only).")
+                self.scaler = scaler
+                X_num_tr = self.scaler.transform(X_num_np)
+            else:
+                if self.scaler_type == "standard":
+                    print("Fitting new StandardScaler...")
+                    self.scaler = StandardScaler()
+                else:
+                    print("Fitting new QuantileTransformer...")
+                    self.scaler = QuantileTransformer(output_distribution='normal')
+                
+                X_num_tr = self.scaler.fit_transform(X_num_np)
         else:
             self.scaler = None
             X_num_tr = np.zeros((N, 0), dtype=np.float32)
 
         if X_cat_np.shape[1] > 0:
             if ohe is None:
+                print("Fitting new OneHotEncoder...")
                 self.ohe = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
                 X_cat_oh = self.ohe.fit_transform(X_cat_np)
             else:
+                print("Using provided OneHotEncoder (transform only).")
                 self.ohe = ohe
                 X_cat_oh = self.ohe.transform(X_cat_np)
+            
             self.cat_cardinalities = [len(c) for c in self.ohe.categories_]
             X_cat_log = np.log(np.clip(X_cat_oh, 1e-30, 1.0)).astype(np.float32)
         else:
@@ -164,7 +174,6 @@ class TabularCounterfactualDataset(Dataset):
                 elif self.search_method == "dpp":
                     query_feats = self.X_model[src_idx]
                     cand_feats = self.X_model[candidates_global] 
-                    
                     chosen = self._select_dpp_greedy_fast(
                         query_feats=query_feats,
                         cand_feats=cand_feats,
@@ -181,24 +190,17 @@ class TabularCounterfactualDataset(Dataset):
 
         return neigh_all
     
-
-    def _select_dpp_greedy_fast(self, query_feats: torch.Tensor, cand_feats: torch.Tensor, cand_indices: torch.Tensor, k: int) -> torch.Tensor:
+    def _select_dpp_greedy_fast(self, query_feats, cand_feats, cand_indices, k):
         B, Pool, F = cand_feats.shape
-        if Pool <= k:
-            return cand_indices
-
-        sigma_q = 1.0
-        sigma_s = 5.0
+        if Pool <= k: return cand_indices
+        sigma_q, sigma_s = 1.0, 5.0
         device = cand_feats.device
-
         dist_qc = torch.cdist(query_feats.unsqueeze(1), cand_feats).squeeze(1) ** 2
         Q = torch.exp(-dist_qc / sigma_q)
         norm_c = (cand_feats ** 2).sum(dim=2, keepdim=True)
         dist_cc = norm_c + norm_c.transpose(1, 2) - 2 * torch.bmm(cand_feats, cand_feats.transpose(1, 2))
-        S = torch.exp(-dist_cc / sigma_s)
-        S = S + torch.eye(Pool, device=device).unsqueeze(0) * 1e-4
+        S = torch.exp(-dist_cc / sigma_s) + torch.eye(Pool, device=device).unsqueeze(0) * 1e-4
         L = S * (Q.unsqueeze(2) * Q.unsqueeze(1))
-
         
         selected_indices_local = torch.zeros((B, k), dtype=torch.long, device=device)
         K = L.clone()
@@ -210,18 +212,13 @@ class TabularCounterfactualDataset(Dataset):
             gains[mask] = -float('inf')
             best_idx = torch.argmax(gains, dim=1)
             selected_indices_local[:, step] = best_idx
-            
             mask.scatter_(1, best_idx.unsqueeze(1), True)
-
             if step < k - 1:
                 best_idx_view = best_idx.view(B, 1, 1).expand(B, Pool, 1)
-                v = K.gather(2, best_idx_view) # (B, Pool, 1)
-                d = v.gather(1, best_idx.view(B, 1, 1)).squeeze(2) # (B, 1)
-                update_term = torch.bmm(v, v.transpose(1, 2)) / (d.unsqueeze(2) + 1e-6)
-                K = K - update_term
-        final_indices = torch.gather(cand_indices, 1, selected_indices_local)
-        
-        return final_indices
+                v = K.gather(2, best_idx_view)
+                d = v.gather(1, best_idx.view(B, 1, 1)).squeeze(2)
+                K = K - torch.bmm(v, v.transpose(1, 2)) / (d.unsqueeze(2) + 1e-6)
+        return torch.gather(cand_indices, 1, selected_indices_local)
 
     def __len__(self) -> int:
         return self.X_model.size(0)
@@ -239,7 +236,10 @@ class TabularCounterfactualDataset(Dataset):
             y_tgt = y_orig 
         return {"x_orig": x_orig, "y": y_orig, "x_neigh": x_neigh, "y_target": y_tgt}
 
-    def to_model_space(self, X_raw: np.ndarray) -> torch.Tensor:
+    def to_model_space(self, X_raw: np.ndarray | pd.DataFrame) -> torch.Tensor:
+        if isinstance(X_raw, pd.DataFrame):
+            X_raw = X_raw.values
+
         N = X_raw.shape[0]
         if self.num_numerical > 0:
             X_num = X_raw[:, self.spec.num_idx].astype(np.float32)
@@ -285,17 +285,31 @@ class TabularCounterfactualDataset(Dataset):
             x_cat_orig = np.zeros((N, 0))
         return np.concatenate([x_num_orig, x_cat_orig], axis=1)
 
-def get_generic_data(data_dir: str, data_config: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, TabularSpec, int]:
+
+def get_generic_data(data_dir: str, data_config: dict):
     train_path = os.path.join(data_dir, "train.csv")
     test_path = os.path.join(data_dir, "test.csv")
+    val_path = os.path.join(data_dir, "val.csv")
     
+    print(f"Loading data from {data_dir}...")
     df_train = pd.read_csv(train_path, skipinitialspace=True)
     df_test = pd.read_csv(test_path, skipinitialspace=True)
     
-    df_train['is_train'] = True
-    df_test['is_train'] = False
-    df_full = pd.concat([df_train, df_test], ignore_index=True)
+    has_val = os.path.exists(val_path)
+    if has_val:
+        print("Found val.csv")
+        df_val = pd.read_csv(val_path, skipinitialspace=True)
+    else:
+        print("No val.csv found. Will return None for X_val, y_val.")
+        df_val = pd.DataFrame()
 
+    df_train['split'] = 'train'
+    df_test['split'] = 'test'
+    if has_val:
+        df_val['split'] = 'val'
+        df_full = pd.concat([df_train, df_val, df_test], ignore_index=True)
+    else:
+        df_full = pd.concat([df_train, df_test], ignore_index=True)
     num_cols = data_config.get("numerical_columns", [])
     cat_cols = data_config.get("categorical_columns", [])
     target_col = data_config.get("target_column")
@@ -303,14 +317,12 @@ def get_generic_data(data_dir: str, data_config: dict) -> tuple[np.ndarray, np.n
     missing_vals = data_config.get("missing_values", ["nan", "NaN", "?"])
 
     df_full[target_col] = df_full[target_col].astype(str).str.strip().str.replace('.', '', regex=False)
-    
     if positive_val:
-        df_full[target_col] = (df_full[target_col] == positive_val).astype(int)
+        df_full[target_col] = (df_full[target_col] == str(positive_val)).astype(int)
     else:
-        df_full[target_col] = df_full[target_col].astype(int)
+        df_full[target_col] = pd.to_numeric(df_full[target_col], errors='coerce').fillna(0).astype(int)
 
     y_full = df_full[target_col].to_numpy()
-
     for col in num_cols:
         if col in df_full.columns:
             df_full[col] = pd.to_numeric(df_full[col], errors='coerce')
@@ -320,20 +332,35 @@ def get_generic_data(data_dir: str, data_config: dict) -> tuple[np.ndarray, np.n
         if col in df_full.columns:
             df_full[col] = df_full[col].astype(str).str.strip()
             df_full[col] = df_full[col].replace(missing_vals, np.nan)
-            mode_val = df_full[col].mode()[0]
-            df_full[col] = df_full[col].fillna(mode_val)
+            if df_full[col].isnull().all():
+                df_full[col] = "Missing"
+            else:
+                mode_val = df_full[col].mode()[0]
+                df_full[col] = df_full[col].fillna(mode_val)
+    
     valid_num = [c for c in num_cols if c in df_full.columns]
     valid_cat = [c for c in cat_cols if c in df_full.columns]
 
     X_num = df_full[valid_num].to_numpy().astype(np.float32)
     X_cat = df_full[valid_cat].to_numpy()
-    
     X_final = np.concatenate([X_num, X_cat], axis=1)
 
     spec = TabularSpec(
         num_idx=list(range(len(valid_num))),
-        cat_idx=list(range(len(valid_num), len(valid_num) + len(valid_cat)))
+        cat_idx=list(range(len(valid_num), len(valid_num) + len(valid_cat))),
+        target_col=target_col
     )
     
-    mask_train = df_full['is_train'].values
-    return X_final[mask_train], X_final[~mask_train], y_full[mask_train], y_full[~mask_train], spec, valid_num
+    mask_train = (df_full['split'] == 'train').values
+    mask_test = (df_full['split'] == 'test').values
+    
+    X_train, y_train = X_final[mask_train], y_full[mask_train]
+    X_test, y_test = X_final[mask_test], y_full[mask_test]
+    
+    if has_val:
+        mask_val = (df_full['split'] == 'val').values
+        X_val, y_val = X_final[mask_val], y_full[mask_val]
+    else:
+        X_val, y_val = None, None
+
+    return X_train, X_val, X_test, y_train, y_val, y_test, spec

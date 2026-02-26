@@ -1,8 +1,8 @@
 import torch
 import wandb
 from torch.utils.data import DataLoader
-from tabdce.model.denoise_fn import TabularEpsModel
-from tabdce.model.diffusion import MixedTabularDiffusion
+from tabdce.model.denoise_fn_tabddpm import TabularEpsModel
+from tabdce.model.diffusion_tabddpm import MixedTabularDiffusion
 
 def train(
     cfg,

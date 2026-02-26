@@ -1,10 +1,10 @@
 project_name: "tabdce-diffusion"  
-run_name: "default-run_dpp"
+run_name: "default-TabSyn-dpp"
 
 dataset:
   name: "default"
   data_dir: "data/default"  
-  n_samples: 10000
+  n_samples: 3000
   noise: 0.1
   k_neighbors: 50
   search_method: "dpp"
@@ -22,6 +22,12 @@ diffusion:
   T: 200
   schedule: "cosine"
 
+vae:
+  latent_dim: 64 
+  hidden_dims: [256, 128]
+  lr: 0.0001
+  epochs: 200
+
 model:
   hidden_dim: 256
   depth: 3
@@ -30,10 +36,17 @@ model:
 train:
   batch_size: 32
   lr: 0.001
-  epochs: 2500
+  epochs: 200
   device: "cuda"
   output_dir: "checkpoints_const"
 
+svdd:
+  n_candidates: 50
+  guidance_scale: 20.0
+  dist_scale: 0.1
+  cat_scale: 0.0
+  temperature: 2.0
+
 eval:
-  n_test_samples: 1000
+  n_test_samples: 2000
   n_cf_per_sample: 10
