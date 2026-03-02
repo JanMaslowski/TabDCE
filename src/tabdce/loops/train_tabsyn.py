@@ -18,11 +18,12 @@ def train(cfg: dict, dataset):
         device = torch.device("cpu")
 
     batch_size = cfg['train'].get('batch_size', 128)
-    batch_size = cfg['train'].get('batch_size', 128)    
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
     num_dim = dataset.num_numerical
     cat_dims = dataset.cat_cardinalities 
     y_classes = max(2, dataset.num_classes_target)
+    
     lr_vae     = cfg['vae'].get('lr', 1e-3)
     epochs_vae = cfg['vae'].get('epochs', 500)
     vae_path      = cfg['vae'].get('vae_path', None)
@@ -56,26 +57,39 @@ def train(cfg: dict, dataset):
         vae.train()
         
         for epoch in range(epochs_vae):
-            epoch_loss = 0.0
+            # Słownik na akumulację wszystkich typów lossów w danej epoce
+            epoch_losses = {}
+            
             for batch in dataloader:
                 x = batch["x_orig"].to(device)
                 
                 optimizer_vae.zero_grad()
                 recon_num, recon_cats, mu, logvar = vae(x)
+                
+                # Zbieramy cały słownik z funkcji kosztu
                 loss_dict = vae.loss_function(recon_num, recon_cats, x, mu, logvar)
                 loss = loss_dict["loss"]
                 
                 loss.backward()
                 optimizer_vae.step()
                 
-                epoch_loss += loss.item()
+                # Akumulacja wszystkich metryk
+                for k, v in loss_dict.items():
+                    val = v.item() if isinstance(v, torch.Tensor) else float(v)
+                    epoch_losses[k] = epoch_losses.get(k, 0.0) + val
                 
-            avg_loss = epoch_loss / len(dataloader)
+            # Wyliczanie średnich dla epoki
+            avg_losses = {k: v / len(dataloader) for k, v in epoch_losses.items()}
             
             if (epoch + 1) % 10 == 0:
-                print(f"[VAE] Epoch {epoch+1}/{epochs_vae} | Loss: {avg_loss:.4f}")
+                # Dynamiczne generowanie logów dla konsoli
+                loss_str = " | ".join([f"{k}: {v:.4f}" for k, v in avg_losses.items()])
+                print(f"[VAE] Epoch {epoch+1}/{epochs_vae} | {loss_str}")
                 
-            wandb.log({"vae/loss": avg_loss, "epoch": epoch+1})
+            # Logowanie wszystkich metryk do wandb (z prefiksem vae/)
+            wandb_log_dict = {f"vae/{k}": v for k, v in avg_losses.items()}
+            wandb_log_dict["epoch"] = epoch + 1
+            wandb.log(wandb_log_dict)
             
         if vae_save_path:
             os.makedirs(os.path.dirname(vae_save_path), exist_ok=True)
@@ -86,14 +100,31 @@ def train(cfg: dict, dataset):
     for param in vae.parameters():
         param.requires_grad = False
     print(">>> VAE wytrenowane i zamrożone.")
+    
+    # print("\n--- TEST VAE ---")
+    # with torch.no_grad():
+    #     test_batch = next(iter(dataloader))
+    #     test_x = test_batch["x_orig"][:5].to(device) 
+        
+    #     # Test 1: Pełen przepływ (żeby sprawdzić, co widzi loss podczas treningu)
+    #     recon_forward, _, _, _ = vae(test_x)
+        
+    #     # Test 2: Przejście przez encode/decode (tak, jak używa tego dyfuzja)
+    #     latent = vae.encode(test_x)
+    #     recon_x = vae.decode(latent)
+        
+    #     mse_forward = F.mse_loss(recon_forward, test_x).item()
+    #     mse_diffusion = F.mse_loss(recon_x, test_x).item()
+        
+    #     print("Oryginał:\n", test_x.cpu().numpy().round(4))
+    #     print("Rekonstrukcja (Encode->Decode):\n", recon_x.cpu().numpy().round(4))
+    #     print(f"\nMSE w oryginalnym modelu (jak w treningu): {mse_forward:.6f}")
+    #     print(f"MSE dla Dyfuzji (Encode->Decode): {mse_diffusion:.6f}")
+    # print("----------------\n")
+    
     diffusion_latent_dim = vae.flat_latent_dim
     print(f"\n=== FAZA 2: Trening Latent Diffusion ({epochs_diff} epok) ===")
     T = cfg['diffusion'].get('T', 200)
-    denoise_model = TabularEpsModel(
-        latent_dim=diffusion_latent_dim, 
-        y_classes=y_classes,
-        hidden=hidden_dim
-    ).to(device)
     
     diffusion = LatentTabularDiffusion(
         denoise_fn=None,
@@ -117,16 +148,21 @@ def train(cfg: dict, dataset):
             loss = diffusion(x_neigh, x_orig, y_tgt)
             
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(denoise_model.parameters(), max_norm=1.0)
-            optimizer_diff.step()
             
+            # POPRAWKA: Obcinamy gradienty faktycznego obiektu dyfuzji!
+            torch.nn.utils.clip_grad_norm_(diffusion.parameters(), max_norm=1.0)
+            
+            optimizer_diff.step()
             epoch_loss += loss.item()
             
         avg_loss = epoch_loss / len(dataloader)
         wandb.log({
             "diffusion/loss": avg_loss,
-            "epoch": epoch + 1 + epochs_vae
+            "epoch": epoch + 1 + epochs_vae # Epoki sumują się w wandb po treningu VAE
         })
-        print(f"[Diff] Epoch {epoch+1}/{epochs_diff} | Loss: {avg_loss:.4f}")
+        
+        if (epoch + 1) % 10 == 0:
+            print(f"[Diff] Epoch {epoch+1}/{epochs_diff} | Loss: {avg_loss:.4f}")
+            
     diffusion.eval()
     return diffusion

@@ -6,11 +6,12 @@ import torch
 import numpy as np
 import wandb
 import random
+import pandas as pd
 
 from tabdce.loops.train_tabsyn import train 
 from tabdce.loops.train_classifier import train_classifier
 from tabdce.dataset.dataset import TabularCounterfactualDataset, get_generic_data
-from tabdce.utils.advanced_metrics import MetricsEvaluator
+from tabdce.utils.advanced_metrics import MetricsEvaluator,generate_knn_counterfactuals
 
 
 def load_config(path: str) -> dict:
@@ -130,6 +131,7 @@ def main():
         )
     
     group_ids = np.arange(len(x_orig)).repeat(N_CF_PER_SAMPLE)
+    X_train_np_inv = train_dataset.inverse_transform(train_dataset.X_model)
     print("\n=== Calculating Metrics ===")
     evaluator = MetricsEvaluator(train_dataset)
     metrics = evaluator.evaluate(
@@ -140,6 +142,44 @@ def main():
         X_train_np=train_dataset.inverse_transform(train_dataset.X_model),
         clf_model=clf_model  
     )
+
+    print("\n=== Generowanie CF (kNN Baseline) ===")
+    final_cfs_knn = generate_knn_counterfactuals(
+        x_orig, # Przekazujemy NIErozszerzone dane wejściowe!
+        y_target, 
+        train_dataset, 
+        k_neighbors=N_CF_PER_SAMPLE
+    )
+
+    print("Obliczanie Metryk (kNN)...")
+    metrics_knn = evaluator.evaluate(
+        x_orig_tensor=x_input_expanded, # Używamy rozszerzonych oryginałów do metryk
+        x_cf_tensor=final_cfs_knn,     
+        y_target_tensor=y_input_expanded,
+        cf_group_ids=group_ids,
+        X_train_np=X_train_np_inv,
+        clf_model=clf_model  
+    )
+    # --- 3. WYDRUK I ZAPIS DO PLIKU ---
+    all_keys = sorted(list(set(metrics.keys()).union(set(metrics_knn.keys()))))
+
+    for k in all_keys:
+        val_diff = metrics.get(k, 0.0)
+        val_knn = metrics_knn.get(k, 0.0)
+        print(f"{k:>15} | Dyfuzja: {val_diff:<8.4f} | kNN: {val_knn:<8.4f}")
+
+    # Zapis do pliku CSV dla późniejszej analizy
+    run_name = cfg.get("run_name", None)
+    results_file = f"metrics_comparison_{run_name}.csv" if run_name else "metrics_comparison.csv"
+    file_exists = os.path.isfile(results_file)
+
+    row_data = {"Model": ["Diffusion", "kNN"]}
+    for k in all_keys:
+        row_data[k] = [metrics.get(k, 0.0), metrics_knn.get(k, 0.0)]
+        
+    df_res = pd.DataFrame(row_data)
+    df_res.to_csv(results_file, mode='a', header=not file_exists, index=False)
+    print(f"\n[INFO] Wyniki dopisane do pliku: {results_file}")
     
     for k, v in metrics.items():
         print(f"{k:<30}: {v:.4f}")

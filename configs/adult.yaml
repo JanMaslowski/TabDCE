@@ -1,5 +1,5 @@
 project_name: "tabdce-diffusion" 
-run_name: "adult-TabSyn-dpp"
+run_name: "adult-TabSyn-AE"
 
 dataset:
   name: "adult"
@@ -26,12 +26,12 @@ vae:
   latent_dim: 64 
   hidden_dims: [256, 128]
   lr: 0.0001
-  epochs: 1000
-  vae_path: "checkpoints/adult_vae_trans_large.pt"       # Skąd ma próbować wczytać
-  vae_save_path: "checkpoints/adult_vae_trans_large.pt"  
+  epochs: 400
+  vae_path: "checkpoints/AE_adult.pt"       # Skąd ma próbować wczytać
+  vae_save_path: "checkpoints/AE_adult.pt"  
 
 model:
-  hidden_dim: 2512
+  hidden_dim: 256
   depth: 5
   dropout: 0.0
 
@@ -40,7 +40,7 @@ train:
   lr: 0.0001
   epochs: 1000
   device: "cuda"
-  output_dir: "checkpoints_const"
+  output_dir: "checkpoints_tabsyn"
 
 svdd:
   n_candidates: 50
@@ -50,5 +50,5 @@ svdd:
   temperature: 2.0
 
 eval:
-  n_test_samples: 500
+  n_test_samples: 1000
   n_cf_per_sample: 10

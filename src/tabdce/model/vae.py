@@ -267,7 +267,7 @@ class VAE(nn.Module):
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
-        return mu + eps * std
+        return mu #+ eps * std
 
     def forward(self, x_num, x_cat):
         x = self.Tokenizer(x_num, x_cat)
@@ -445,6 +445,6 @@ class TabularVAE(nn.Module):
         logvar = std_z 
         kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=[1, 2])
         kld = kld.mean()
-        total_loss = loss_num + loss_cat + 0.1 * kld
+        total_loss = loss_num + loss_cat + 0.001 * kld
         
         return {"loss": total_loss, "recon_num": loss_num, "recon_cat": loss_cat, "kld": kld}

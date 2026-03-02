@@ -4,9 +4,9 @@ run_name: "two-moons-TabSyn-dpp"
 dataset:
   name: "two_moons"
   data_dir: "data/two_moons"  
-  n_samples: 500
+  n_samples: 1000
   noise: 0.1
-  k_neighbors: 50
+  k_neighbors: 20
   search_method: "knn"
   scaler: "standard"  #"quantile" , "standard"
 
@@ -23,22 +23,22 @@ diffusion:
   schedule: "cosine"
 
 vae:
-  latent_dim: 64 
-  hidden_dims: [256, 128]
+  latent_dim: 2
+  hidden_dims: [16, 16]
   lr: 0.0001
-  epochs: 400
-  vae_path: "checkpoints/two_moons_vae_transform.pt"       # Skąd ma próbować wczytać
-  vae_save_path: "checkpoints/two_moons_vae_transform.pt"
+  epochs: 250
+  vae_path: "checkpoints/two_moons_2dim_2.pt"       # Skąd ma próbować wczytać
+  vae_save_path: "checkpoints/two_moons_2dim_2.pt"
 
 model:
-  hidden_dim: 256
-  depth: 3
+  hidden_dim: 32
+  depth: 2
   dropout: 0.0
 
 train:
-  batch_size: 8
-  lr: 0.001
-  epochs: 700
+  batch_size: 16
+  lr: 0.0005
+  epochs: 500
   device: "cuda"
   output_dir: "checkpoints_const"
 

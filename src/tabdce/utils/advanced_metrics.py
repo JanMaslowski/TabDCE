@@ -180,3 +180,35 @@ class MetricsEvaluator:
                 results[name] = 0.0
 
         return results
+
+def generate_knn_counterfactuals(x_orig_unexpanded, y_target_unexpanded, dataset, k_neighbors=10):
+
+    device = x_orig_unexpanded.device
+    N = x_orig_unexpanded.shape[0]
+    
+    X_train_tensor = dataset.X_model
+    y_train_tensor = dataset.y
+    
+    knn_cfs_list = []
+    
+    for i in range(N):
+        curr_x = x_orig_unexpanded[i].unsqueeze(0)
+        target_y = y_target_unexpanded[i].item()
+        
+        mask = (y_train_tensor == target_y)
+        pool = X_train_tensor[mask]
+        if len(pool) == 0:
+            knn_cfs_list.append(curr_x.repeat(k_neighbors, 1))
+            continue
+        dist = torch.cdist(curr_x, pool, p=2).squeeze(0)
+        k_actual = min(k_neighbors, len(pool))
+        _, topk_idx = torch.topk(dist, k=k_actual, largest=False, sorted=True)
+        
+        cfs = pool[topk_idx]
+        if k_actual < k_neighbors:
+            pad = cfs[-1:].repeat(k_neighbors - k_actual, 1)
+            cfs = torch.cat([cfs, pad], dim=0)
+            
+        knn_cfs_list.append(cfs)
+        
+    return torch.cat(knn_cfs_list, dim=0)

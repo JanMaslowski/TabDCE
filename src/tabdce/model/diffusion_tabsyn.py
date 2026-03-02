@@ -24,42 +24,77 @@ class PositionalEmbedding(torch.nn.Module):
         x = torch.cat([x.cos(), x.sin()], dim=1)
         return x
 
-class ConditionalMLPDiffusion(nn.Module):
-    def __init__(self, d_in, y_classes, dim_t = 512):
+class ResidualBlock(nn.Module):
+    def __init__(self, dim, emb_dim):
         super().__init__()
-        self.dim_t = dim_t
-        self.proj = nn.Linear(d_in * 2 + 64, dim_t)
+        self.linear1 = nn.Linear(dim, dim)
+        self.act = nn.SiLU()
+        self.linear2 = nn.Linear(dim, dim)
+        
+        # Prawdziwe FiLM wymaga DWÓCH wektorów sterujących dla każdego neuronu (Gamma i Beta)
+        # Dlatego wyjście to dim * 2
+        self.emb_proj = nn.Linear(emb_dim, dim * 2)
+
+    def forward(self, x, emb):
+        # Generujemy suwaki (Gamma) i przesunięcia (Beta) z warunku
+        emb_out = self.emb_proj(emb)
+        gamma, beta = emb_out.chunk(2, dim=-1)
+        
+        # MAGIA FiLM: Brutalne mnożenie neuronów przez warunek!
+        # Jeśli warunek chce zgasić jakąś cechę, gamma będzie bliskie -1 (wtedy 1 + gamma = 0)
+        h = x * (1 + gamma) + beta
+        
+        return x + self.linear2(self.act(self.linear1(h)))
+
+class ConditionalMLPDiffusion(nn.Module):
+    def __init__(self, d_in, y_classes, dim_t=128):
+        super().__init__()
+        
+        # Mniejsza, zgrabniejsza sieć: 256 neuronów na warstwę
+        self.dim_t = max(256, d_in * 2) 
+        
+        self.proj = nn.Linear(d_in * 2 + 64, self.dim_t)
         self.y_emb = nn.Embedding(y_classes + 1, 64)
 
-        self.mlp = nn.Sequential(
-            nn.Linear(dim_t, dim_t * 2),
+        self.map_noise = PositionalEmbedding(num_channels=self.dim_t)
+        self.time_embed = nn.Sequential(
+            nn.Linear(self.dim_t, self.dim_t),
             nn.SiLU(),
-            nn.Linear(dim_t * 2, dim_t * 2),
-            nn.SiLU(),
-            nn.Linear(dim_t * 2, dim_t* 2),
-            nn.SiLU(),
-            nn.Linear(dim_t * 2, dim_t),
-            nn.SiLU(),
-            nn.Linear(dim_t, d_in),
+            nn.Linear(self.dim_t, self.dim_t)
+        )
+        
+        # Projektor do FiLM
+        self.cond_proj = nn.Sequential(
+            nn.Linear(self.dim_t + 64, self.dim_t),
+            nn.SiLU()
         )
 
-        self.map_noise = PositionalEmbedding(num_channels=dim_t)
-        self.time_embed = nn.Sequential(
-            nn.Linear(dim_t, dim_t),
+        # Używamy naszych klocków z FiLM!
+        self.blocks = nn.ModuleList([
+            ResidualBlock(self.dim_t, emb_dim=self.dim_t),
+            ResidualBlock(self.dim_t, emb_dim=self.dim_t),
+            ResidualBlock(self.dim_t, emb_dim=self.dim_t)
+        ])
+        
+        self.out_layer = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(dim_t, dim_t)
+            nn.Linear(self.dim_t, d_in)
         )
     
     def forward(self, x_t, noise_labels, z_orig, y_target):
-        emb = self.map_noise(noise_labels)
-        emb = emb.reshape(emb.shape[0], 2, -1).flip(1).reshape(*emb.shape) 
-        emb = self.time_embed(emb)
-        y_e = self.y_emb(y_target)
-        x = torch.cat([x_t, z_orig, y_e], dim=-1)
-        x = self.proj(x) + emb
-        delta = self.mlp(x)
-        return z_orig + delta
-
+        # 1. Przygotowanie wejścia
+        x = torch.cat([x_t, z_orig, self.y_emb(y_target)], dim=-1)
+        h = self.proj(x)
+        
+        # 2. Przygotowanie WARUNKU (Czas + Klasa) dla FiLM
+        t_emb = self.time_embed(self.map_noise(noise_labels))
+        cond = self.cond_proj(torch.cat([t_emb, self.y_emb(y_target)], dim=-1))
+        
+        # 3. Przepuszczamy przez bloki rezydualne
+        for block in self.blocks:
+            h = block(h, cond)
+            
+        return self.out_layer(h)
 
 class Precond(nn.Module):
     def __init__(
@@ -137,28 +172,18 @@ class LatentTabularDiffusion(nn.Module):
         z_orig = z_orig * self.scale_factor
 
         rnd_normal = torch.randn(B, device=device)
-        sigma = (rnd_normal * self.P_std + self.P_mean).exp()
-        weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
+        sigma = (rnd_normal * self.P_std + self.P_mean).exp().clamp(min=1e-3)
+        weight = ((sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2).clamp(max=100.0)
         
         noise = torch.randn_like(z_neigh) * sigma.unsqueeze(1)
         z_t = z_neigh + noise
         
-        drop_z_prob = 0.2
-        drop_z_mask = torch.rand(B, device=device) < drop_z_prob
-        z_orig_cond = z_orig.clone()
-        z_orig_cond[drop_z_mask] = 0.0  
-        
-        drop_y_prob = 0.15
-        null_token_id = self.precond.denoise_fn_F.y_emb.num_embeddings - 1 
-        drop_y_mask = torch.rand(B, device=device) < drop_y_prob
-        
-        y_train_cond = y_target.clone()
-        y_train_cond[drop_y_mask] = null_token_id
-
-        D_x = self.precond(z_t, sigma, z_orig_cond, y_train_cond)
+        # CZYSTY TRENING WARUNKOWY - Bez dropoutu, model zawsze widzi z_orig i y_target!
+        D_x = self.precond(z_t, sigma, z_orig, y_target)
         
         loss = weight.unsqueeze(1) * ((D_x - z_neigh) ** 2)
         return loss.mean()
+
     def get_sigmas_karras(self, n, sigma_min=0.002, sigma_max=80.0, rho=7.0, device=None):
         if device is None:
             device = self.device
@@ -174,35 +199,37 @@ class LatentTabularDiffusion(nn.Module):
         x_orig: torch.Tensor,
         y_target: torch.Tensor,
         temperature: float = 1.0,  
-        guidance_scale: float = 5.0
+        guidance_scale: float = 1.0
     ) -> torch.Tensor:
         
         device = next(self.parameters()).device
         x_orig = x_orig.to(device)
         y_target = y_target.to(device)
         B = x_orig.shape[0]
+        
+        # Kodujemy oryginał
         z_orig = self.vae.encode(x_orig) * self.scale_factor
         
-        sigmas = self.get_sigmas_karras(self.T_steps, device=device)
+        # MAGIA: Startujemy z szumu, na którym model faktycznie trenował!
+        sigmas = self.get_sigmas_karras(self.T_steps, sigma_max=5.0, device=device)
+        
+        # Zaczynamy od szumu dopasowanego do treningu
         x = torch.randn(B, self.latent_dim, device=device) * sigmas[0] * temperature
         
-        null_token_id = self.precond.denoise_fn_F.y_emb.num_embeddings - 1
-        y_null = torch.full_like(y_target, null_token_id, device=device)
-        
+        # Pętla odszumiająca
         for i in range(len(sigmas) - 1):
             sigma = sigmas[i]
             sigma_next = sigmas[i + 1]
             sigma_tensor = torch.full((B,), sigma.item(), device=device)
             
-            if guidance_scale > 1.0:
-                D_uncond = self.precond(x, sigma_tensor, z_orig, y_null)
-                D_cond = self.precond(x, sigma_tensor, z_orig, y_target)
-                D_x = D_uncond + guidance_scale * (D_cond - D_uncond)
-            else:
-                D_x = self.precond(x, sigma_tensor, z_orig, y_target)
+            # Tylko jedno przejście przez sieć w kierunku y_target
+            D_x = self.precond(x, sigma_tensor, z_orig, y_target)
 
             d = (x - D_x) / sigma
             x = x + d * (sigma_next - sigma)
+            
+        # Zabezpieczenie przed przepełnieniem pamięci (overflow / NaN) w VAE
+        x = x.clamp(-50.0, 50.0)
             
         x = x / self.scale_factor
         x_cf = self.vae.decode(x)
