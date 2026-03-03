@@ -4,51 +4,33 @@ run_name: "adult-TabSyn-AE"
 dataset:
   name: "adult"
   data_dir: "data/adult"  
-  n_samples: 5000
-  noise: 0.1
-  k_neighbors: 50
-  search_method: "knn"
-  scaler: "standard"  #"quantile" , "standard"
+  n_samples: 1000
+  k_neighbors: 20
+  search_method: "dpp"
+  scaler: "standard"  # Upewnij się, że w run_tabsyn.py przekazujesz: scaler_type=cfg['dataset'].get('scaler', 'standard')
+  n_test_samples: 200
+  n_cf_per_sample: 10
 
 classifier:
   train: true           
-  relabel: true         
-  hidden_layers: [64, 32] 
+  hidden_layers: [32, 32] 
   lr: 0.001
   epochs: 100
   batch_size: 64
 
 diffusion:
   T: 50
-  schedule: "cosine"
-
-vae:
-  latent_dim: 64 
-  hidden_dims: [256, 128]
-  lr: 0.0001
-  epochs: 400
-  vae_path: "checkpoints/AE_adult.pt"       # Skąd ma próbować wczytać
-  vae_save_path: "checkpoints/AE_adult.pt"  
 
 model:
-  hidden_dim: 256
-  depth: 5
-  dropout: 0.0
+  num_layers: 4      # Podbijamy do 4. Dajemy sieci czas na przemyślenie ruchu.
+  d_token: 16        # [KLUCZOWE] Zwiększamy z 8 na 32. Punkty wreszcie będą miały rozdzielczość, by trafić w dystrybucję.
+  n_head: 4          # 4 głowy atencji - model szybciej skojarzy współrzędne z warunkiem klasy.
+  dim_t: 64       # [KLUCZOWE] Dyfuzja musi mieć szerokie gardło dla czasu t! W oryginalnych pracach to zazwyczaj 256 lub 512. My dajemy solidne 128.
+  factor: 5          # Mnożnik dla warstwy FeedForward (d_token * factor)
 
 train:
   batch_size: 32
-  lr: 0.0001
-  epochs: 1000
+  lr: 0.001
+  epochs: 50
   device: "cuda"
-  output_dir: "checkpoints_tabsyn"
-
-svdd:
-  n_candidates: 50
-  guidance_scale: 20.0
-  dist_scale: 0.1
-  cat_scale: 0.0
-  temperature: 2.0
-
-eval:
-  n_test_samples: 1000
-  n_cf_per_sample: 10
+  output_dir: "checkpoints_const"

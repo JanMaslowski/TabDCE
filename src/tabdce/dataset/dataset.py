@@ -5,8 +5,8 @@ import os
 import pandas as pd
 import numpy as np
 import torch
-from torch.utils.data import Dataset
-from sklearn.preprocessing import QuantileTransformer, OneHotEncoder, StandardScaler
+from torch.utils.data import Dataset,DataLoader
+from sklearn.preprocessing import QuantileTransformer, StandardScaler, OrdinalEncoder
 
 @dataclass
 class TabularSpec:
@@ -14,7 +14,6 @@ class TabularSpec:
     cat_idx: List[int]
     target_col: str = None 
     cat_cardinalities: List[int] = None
-
 
 class TabularCounterfactualDataset(Dataset):
     def __init__(
@@ -28,11 +27,10 @@ class TabularCounterfactualDataset(Dataset):
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
         scaler_type="quantile",
-        ohe: OneHotEncoder | None = None,
         scaler: object | None = None,
+        ordinal_encoder: OrdinalEncoder | None = None,
         build_neighbors: bool = True,
         gower_weight: float = 1.0,
-        data_dir: str = ""
     ) -> None:
         super().__init__()
 
@@ -42,127 +40,74 @@ class TabularCounterfactualDataset(Dataset):
         self.k = k
         self.search_method = search_method
         self.dpp_pool_factor = dpp_pool_factor
-        self.scaler_type = scaler_type
         self.gower_weight = gower_weight
-        self.data_dir = data_dir
 
-        if isinstance(y, torch.Tensor):
-            self.y = y.long().to(self.device)
-        else:
-            self.y = torch.from_numpy(y).long().to(self.device)
-        
+        self.y = y.long().to(device) if isinstance(y, torch.Tensor) else torch.from_numpy(y).long().to(device)
         self.num_classes_target = len(torch.unique(self.y))
+        
         X_np = X.cpu().numpy() if isinstance(X, torch.Tensor) else X
         N = X_np.shape[0]
-        if len(spec.num_idx) > 0:
-            X_num_np = X_np[:, spec.num_idx].astype(np.float32)
-        else:
-            X_num_np = np.zeros((N, 0), dtype=np.float32)
 
-        if len(spec.cat_idx) > 0:
-            X_cat_np = X_np[:, spec.cat_idx]
-        else:
-            X_cat_np = np.zeros((N, 0))
-
-        self.num_numerical = X_num_np.shape[1]
+        self.num_numerical = len(spec.num_idx)
         if self.num_numerical > 0:
+            X_num_np = X_np[:, spec.num_idx].astype(np.float32)
             if scaler is not None:
-                print("Using provided scaler (transform only).")
                 self.scaler = scaler
                 X_num_tr = self.scaler.transform(X_num_np)
             else:
-                if self.scaler_type == "standard":
-                    print("Fitting new StandardScaler...")
-                    self.scaler = StandardScaler()
-                else:
-                    print("Fitting new QuantileTransformer...")
-                    self.scaler = QuantileTransformer(output_distribution='normal')
-                
+                self.scaler = StandardScaler() if scaler_type == "standard" else QuantileTransformer(output_distribution='normal')
                 X_num_tr = self.scaler.fit_transform(X_num_np)
         else:
             self.scaler = None
             X_num_tr = np.zeros((N, 0), dtype=np.float32)
 
-        if X_cat_np.shape[1] > 0:
-            if ohe is None:
-                print("Fitting new OneHotEncoder...")
-                self.ohe = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
-                X_cat_oh = self.ohe.fit_transform(X_cat_np)
+        if len(spec.cat_idx) > 0:
+            X_cat_np = X_np[:, spec.cat_idx]
+            if ordinal_encoder is None:
+                self.ordinal_encoder = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+                X_cat_idx = self.ordinal_encoder.fit_transform(X_cat_np).astype(np.int64)
             else:
-                print("Using provided OneHotEncoder (transform only).")
-                self.ohe = ohe
-                X_cat_oh = self.ohe.transform(X_cat_np)
-            
-            self.cat_cardinalities = [len(c) for c in self.ohe.categories_]
-            X_cat_log = np.log(np.clip(X_cat_oh, 1e-30, 1.0)).astype(np.float32)
+                self.ordinal_encoder = ordinal_encoder
+                X_cat_idx = self.ordinal_encoder.transform(X_cat_np).astype(np.int64)
+            self.cat_cardinalities = [len(cats) for cats in self.ordinal_encoder.categories_]
         else:
-            self.ohe = None
+            self.ordinal_encoder = None
             self.cat_cardinalities = []
-            X_cat_log = np.zeros((N, 0), dtype=np.float32)
+            X_cat_idx = np.zeros((N, 0), dtype=np.int64)
 
         if spec.cat_cardinalities is None:
             spec.cat_cardinalities = self.cat_cardinalities
 
-        X_model_np = np.concatenate([X_num_tr.astype(np.float32), X_cat_log], axis=1)
-        self.X_model = torch.from_numpy(X_model_np).to(self.device).to(dtype)
-        if build_neighbors:
-            if self.num_numerical > 0:
-                X_feat = torch.from_numpy(X_num_tr.astype(np.float32)).to(self.device)
-            else:
-                X_feat = torch.zeros((N, 1), device=self.device)
-            
-            print(f"Building neighbors using method: {self.search_method.upper()}")
-            self.neigh_idx = self._build_opposite_class_neighbors(X_feat, self.y, k=self.k)
-        else:
-            self.neigh_idx = None
+        self.X_num = torch.from_numpy(X_num_tr.astype(np.float32)).to(device)
+        self.X_cat = torch.from_numpy(X_cat_idx).to(device)
+        X_model_np = np.concatenate([X_num_tr, X_cat_idx.astype(np.float32)], axis=1)
+        self.X_model = torch.from_numpy(X_model_np).to(device).to(dtype)
 
-    def _build_opposite_class_neighbors(self, X_feat: torch.Tensor, y: torch.Tensor, k: int) -> torch.Tensor:
-        N = self.X_model.size(0)
+        self.neigh_idx = self._build_opposite_class_neighbors(self.X_model, self.y, k=self.k) if build_neighbors else None
+
+
+    def _build_opposite_class_neighbors(self, X_model: torch.Tensor, y: torch.Tensor, k: int) -> torch.Tensor:
+        N = X_model.size(0)
         neigh_all = torch.zeros((N, k), dtype=torch.long, device=self.device)
         classes = y.unique().tolist()
-        
         k_pool = k * self.dpp_pool_factor if self.search_method == "dpp" else k
-        if self.num_numerical > 0:
-            X_num_all = self.X_model[:, :self.num_numerical]
-        else:
-            X_num_all = None
-
-        n_cat_cols_ohe = self.X_model.shape[1] - self.num_numerical
-        if n_cat_cols_ohe > 0:
-            X_cat_all = (self.X_model[:, self.num_numerical:] > -0.5).float()
-            n_cat_features_orig = len(self.spec.cat_idx)
-        else:
-            X_cat_all = None
-            n_cat_features_orig = 0
 
         with torch.no_grad():
             for cls in classes:
-                src_mask = (y == cls)
-                tgt_mask = (y != cls)
-                
-                src_idx = src_mask.nonzero(as_tuple=False).squeeze(1)
-                tgt_idx = tgt_mask.nonzero(as_tuple=False).squeeze(1)
+                src_idx = (y == cls).nonzero(as_tuple=False).squeeze(1)
+                tgt_idx = (y != cls).nonzero(as_tuple=False).squeeze(1)
 
-                if src_idx.numel() == 0: continue
-                if tgt_idx.numel() == 0:
-                    rand = torch.randint(0, N, (src_idx.numel(), k), device=self.device)
-                    neigh_all[src_idx] = rand
-                    continue
-                dists = torch.zeros((src_idx.numel(), tgt_idx.numel()), device=self.device)
+                if src_idx.numel() == 0 or tgt_idx.numel() == 0: continue
+                A = X_model[src_idx]
+                B = X_model[tgt_idx]
                 
-                if X_num_all is not None:
-                    A_num = X_num_all[src_idx]
-                    B_num = X_num_all[tgt_idx]
-                    dist_num = torch.cdist(A_num, B_num, p=1)
-                    dists += dist_num / self.num_numerical
-
-                if X_cat_all is not None and n_cat_features_orig > 0:
-                    A_cat = X_cat_all[src_idx]
-                    B_cat = X_cat_all[tgt_idx]
-                    matches = torch.mm(A_cat, B_cat.t())
-                    dist_cat = 1.0 - (matches / n_cat_features_orig)
-                    
-                    dists += dist_cat * self.gower_weight
+                dists = torch.cdist(A[:, :self.num_numerical], B[:, :self.num_numerical], p=1) / max(1, self.num_numerical)
+                
+                if self.X_cat.shape[1] > 0:
+                    cat_A = A[:, self.num_numerical:]
+                    cat_B = B[:, self.num_numerical:]
+                    cat_diffs = (cat_A.unsqueeze(1) != cat_B.unsqueeze(0)).float().mean(dim=-1)
+                    dists += cat_diffs * self.gower_weight
 
                 curr_pool = min(k_pool, int(tgt_idx.size(0)))
                 _, topk_local_idx = torch.topk(dists, k=curr_pool, largest=False, sorted=True)
@@ -170,21 +115,10 @@ class TabularCounterfactualDataset(Dataset):
 
                 if self.search_method == "knn":
                     chosen = candidates_global[:, :k]
-                
                 elif self.search_method == "dpp":
-                    query_feats = self.X_model[src_idx]
-                    cand_feats = self.X_model[candidates_global] 
-                    chosen = self._select_dpp_greedy_fast(
-                        query_feats=query_feats,
-                        cand_feats=cand_feats,
-                        cand_indices=candidates_global,
-                        k=k
-                    )
-
+                    chosen = self._select_dpp_greedy_fast(X_model[src_idx], X_model[candidates_global], candidates_global, k)
                 if chosen.size(1) < k:
-                    pad_size = k - chosen.size(1)
-                    pad = chosen[:, -1:].repeat(1, pad_size)
-                    chosen = torch.cat([chosen, pad], dim=1)
+                    chosen = torch.cat([chosen, chosen[:, -1:].repeat(1, k - chosen.size(1))], dim=1)
 
                 neigh_all[src_idx] = chosen
 
@@ -221,70 +155,79 @@ class TabularCounterfactualDataset(Dataset):
         return torch.gather(cand_indices, 1, selected_indices_local)
 
     def __len__(self) -> int:
-        return self.X_model.size(0)
+        return self.X_num.size(0)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        x_orig = self.X_model[idx]
+        x_num_orig = self.X_num[idx]
+        x_cat_orig = self.X_cat[idx]
         y_orig = self.y[idx]
+        
         if self.neigh_idx is not None:
             cand_indices = self.neigh_idx[idx]
             chosen_idx = cand_indices[torch.randint(0, cand_indices.numel(), (1,)).item()]
-            x_neigh = self.X_model[chosen_idx]
+            
+            x_num_neigh = self.X_num[chosen_idx]
+            x_cat_neigh = self.X_cat[chosen_idx]
             y_tgt = self.y[chosen_idx]
         else:
-            x_neigh = x_orig.clone()
-            y_tgt = y_orig 
-        return {"x_orig": x_orig, "y": y_orig, "x_neigh": x_neigh, "y_target": y_tgt}
-
-    def to_model_space(self, X_raw: np.ndarray | pd.DataFrame) -> torch.Tensor:
-        if isinstance(X_raw, pd.DataFrame):
-            X_raw = X_raw.values
-
-        N = X_raw.shape[0]
-        if self.num_numerical > 0:
-            X_num = X_raw[:, self.spec.num_idx].astype(np.float32)
-            X_num_tr = self.scaler.transform(X_num)
-        else:
-            X_num_tr = np.zeros((N, 0), dtype=np.float32)
-        if self.ohe is not None:
-            X_cat = X_raw[:, self.spec.cat_idx]
-            X_cat_oh = self.ohe.transform(X_cat)
-            X_cat_log = np.log(np.clip(X_cat_oh, 1e-30, 1.0)).astype(np.float32)
-        else:
-            X_cat_log = np.zeros((N, 0), dtype=np.float32)
-        X_model = np.concatenate([X_num_tr, X_cat_log], axis=1)
-        return torch.from_numpy(X_model).to(self.device).to(self.dtype)
+            x_num_neigh, x_cat_neigh, y_tgt = x_num_orig.clone(), x_cat_orig.clone(), y_orig
+            
+        return {
+            "x_num_orig": x_num_orig, 
+            "x_cat_orig": x_cat_orig,
+            "y": y_orig, 
+            "x_num_neigh": x_num_neigh, 
+            "x_cat_neigh": x_cat_neigh,
+            "y_target": y_tgt
+        }
 
     def inverse_transform(self, x_model: torch.Tensor | np.ndarray) -> np.ndarray:
         if isinstance(x_model, torch.Tensor):
             x_model = x_model.detach().cpu().numpy()
+            
         N = x_model.shape[0]
         if self.num_numerical > 0:
-            x_num_tr = x_model[:, :self.num_numerical]
-            x_num_tr = np.clip(x_num_tr, -5.2, 5.2) 
+            x_num_tr = np.clip(x_model[:, :self.num_numerical], -5.2, 5.2) 
             x_num_orig = self.scaler.inverse_transform(x_num_tr)
         else:
             x_num_orig = np.zeros((N, 0))
-        if self.ohe is not None:
-            x_cat_part = x_model[:, self.num_numerical:]
-            indices_list = []
-            start = 0
-            for k in self.cat_cardinalities:
-                part = x_cat_part[:, start:start+k]
-                idx = np.argmax(part, axis=1)
-                indices_list.append(idx.reshape(-1, 1))
-                start += k
-            x_cat_orig_list = []
-            cat_indices = np.hstack(indices_list)
-            for i, cats in enumerate(self.ohe.categories_):
-                col_indices = cat_indices[:, i]
-                orig_vals = cats[col_indices]
-                x_cat_orig_list.append(orig_vals.reshape(-1, 1))
-            x_cat_orig = np.hstack(x_cat_orig_list)
+            
+        if self.ordinal_encoder is not None:
+            x_cat_idx = x_model[:, self.num_numerical:]
+            x_cat_idx = np.round(x_cat_idx).astype(int)
+            for i, card in enumerate(self.cat_cardinalities):
+                x_cat_idx[:, i] = np.clip(x_cat_idx[:, i], 0, card - 1)
+                
+            x_cat_orig = self.ordinal_encoder.inverse_transform(x_cat_idx)
         else:
             x_cat_orig = np.zeros((N, 0))
+            
         return np.concatenate([x_num_orig, x_cat_orig], axis=1)
-
+    
+    def relabel(self, clf_model, device, batch_size=256):
+        loader = DataLoader(self, batch_size=batch_size, shuffle=False)
+        all_preds = []
+        
+        clf_model.eval()
+        with torch.no_grad():
+            for batch in loader:
+                x_num = batch["x_num_orig"].to(device)
+                x_cat = batch["x_cat_orig"].to(device)
+                
+                outputs = clf_model(x_num, x_cat)
+                if outputs.dim() == 1 or outputs.shape[-1] == 1:
+                    preds = (outputs.squeeze() > 0.5).float()
+                else:
+                    preds = outputs.argmax(dim=1).float()
+                    
+                all_preds.append(preds.cpu())
+                
+        self.y = torch.cat(all_preds, dim=0)
+        
+        counts = torch.bincount(self.y.long())
+        print(f"[Dataset]  New class distribution: {counts.tolist()}")
+        if hasattr(self, 'k') and getattr(self, 'build_neighbors', False):
+            self._build_opposite_class_neighbors()
 
 def get_generic_data(data_dir: str, data_config: dict):
     train_path = os.path.join(data_dir, "train.csv")

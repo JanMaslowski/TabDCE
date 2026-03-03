@@ -97,15 +97,31 @@ class DiversityMixed(Metric):
             
         return float(np.mean(group_diversities))
 
+class LocalOutlierFactorMetric(Metric):
+    def __init__(self, X_train_encoded):
+        self.lof = LocalOutlierFactor(n_neighbors=20, novelty=True)
+        self.lof.fit(X_train_encoded)
+
+    def __call__(self, x_cf_tensor, **kwargs):
+        if len(x_cf_tensor) == 0: 
+            return 0.0
+        
+        X_cf = x_cf_tensor.cpu().numpy()
+        return np.median(np.log(-self.lof.score_samples(X_cf) + 1e-8))
+    
+
 class MetricsEvaluator:
     def __init__(self, dataset):
         self.dataset = dataset 
-        
+        X_train_encoded = self.dataset.X_model.cpu().numpy()
+
+
         self.metrics = {
             "prox_cont": ProximityContinuousL1(),
             "spars_cat": SparsityCategorical(),
             "epsilon_spars": EpsilonSparsity(),
-            "diversity": DiversityMixed()
+            "diversity": DiversityMixed(),
+            "lof_inliers": LocalOutlierFactorMetric(X_train_encoded)
         }
 
     def evaluate(self, 
@@ -181,25 +197,31 @@ class MetricsEvaluator:
 
         return results
 
-def generate_knn_counterfactuals(x_orig_unexpanded, y_target_unexpanded, dataset, k_neighbors=10):
 
+def generate_knn_counterfactuals(x_orig_unexpanded, y_target_unexpanded, dataset, clf_model=None, k_neighbors=10):
     device = x_orig_unexpanded.device
     N = x_orig_unexpanded.shape[0]
-    
     X_train_tensor = dataset.X_model
-    y_train_tensor = dataset.y
+    if clf_model is not None:
+        clf_model.eval()
+        with torch.no_grad():
+            logits = clf_model(X_train_tensor)
+            preds = torch.argmax(logits, dim=1)
+    else:
+        preds = dataset.y
     
     knn_cfs_list = []
     
     for i in range(N):
         curr_x = x_orig_unexpanded[i].unsqueeze(0)
         target_y = y_target_unexpanded[i].item()
-        
-        mask = (y_train_tensor == target_y)
+        mask = (preds == target_y)
         pool = X_train_tensor[mask]
+        
         if len(pool) == 0:
             knn_cfs_list.append(curr_x.repeat(k_neighbors, 1))
             continue
+            
         dist = torch.cdist(curr_x, pool, p=2).squeeze(0)
         k_actual = min(k_neighbors, len(pool))
         _, topk_idx = torch.topk(dist, k=k_actual, largest=False, sorted=True)

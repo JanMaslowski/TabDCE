@@ -3,19 +3,76 @@ import yaml
 import json
 import argparse
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import wandb
 import random
 import pandas as pd
 
-from tabdce.loops.train_tabsyn import train 
+from tabdce.loops.train_diffusion import train 
 from tabdce.loops.train_classifier import train_classifier
 from tabdce.dataset.dataset import TabularCounterfactualDataset, get_generic_data
-from tabdce.utils.advanced_metrics import MetricsEvaluator,generate_knn_counterfactuals
+from tabdce.utils.advanced_metrics import MetricsEvaluator, generate_knn_counterfactuals
 
+@torch.no_grad()
+def sample_counterfactuals_tabdiff(
+    diffusion_model, 
+    x_num_orig: torch.Tensor, 
+    x_cat_orig: torch.Tensor, 
+    noise_level: float = 0.45, 
+    temperature: float = 1.0
+):
+    device = diffusion_model.device
+    b = x_num_orig.shape[0]
+    
+    t = torch.linspace(0, 1, diffusion_model.num_timesteps, dtype=torch.float32, device=device)[:, None]
+    sigma_num_cur = diffusion_model.num_schedule.total_noise(t)
+    sigma_cat_cur = diffusion_model.cat_schedule.total_noise(t)
+    
+    sigma_num_next = torch.zeros_like(sigma_num_cur)
+    sigma_num_next[1:] = sigma_num_cur[0:-1]
+    sigma_cat_next = torch.zeros_like(sigma_cat_cur)
+    sigma_cat_next[1:] = sigma_cat_cur[0:-1]
+
+    start_step = int(noise_level * (diffusion_model.num_timesteps - 1))
+    z_norm = x_num_orig + torch.randn_like(x_num_orig) * sigma_num_cur[start_step] * temperature
+    
+    if x_cat_orig.shape[1] > 0:
+        move_chance = -torch.expm1(-sigma_cat_cur[start_step])
+        z_cat, _ = diffusion_model.q_xt(x_cat_orig, move_chance.repeat(b, 1) if move_chance.dim() == 1 else move_chance)
+    else:
+        z_cat = x_cat_orig
+    for i in reversed(range(0, start_step + 1)):
+        z_norm, z_cat, _ = diffusion_model.edm_update(
+            z_norm, z_cat, i, 
+            t[i], t[i-1] if i > 0 else None, t[i],
+            sigma_num_cur[i], sigma_num_next[i], sigma_num_cur[i], 
+            sigma_cat_cur[i], sigma_cat_next[i], sigma_cat_cur[i],
+        )
+        
+    return z_norm, z_cat
+
+def tabdiff_to_flat_tensor(z_norm, z_cat, cat_cardinalities):
+    cat_parts = []
+    if z_cat is not None and z_cat.shape[1] > 0:
+        for i, card in enumerate(cat_cardinalities):
+            oh = F.one_hot(z_cat[:, i].long(), num_classes=card).float()
+            cat_parts.append(z_cat[:, i:i+1].float())
+            
+    if len(cat_parts) > 0:
+        return torch.cat([z_norm] + cat_parts, dim=-1)
+    return z_norm
+
+class ClfFlatWrapper(nn.Module):
+    def __init__(self, clf, num_num):
+        super().__init__()
+        self.clf = clf
+        self.num_num = num_num
+    def forward(self, x_flat):
+        return self.clf(x_flat[:, :self.num_num], x_flat[:, self.num_num:])
 
 def load_config(path: str) -> dict:
-    """Ładuje config jako czysty słownik."""
     with open(path, 'r') as f:
         return yaml.safe_load(f)
 
@@ -48,10 +105,10 @@ def main():
     device_str = cfg['train'].get('device', 'cuda')
     if torch.cuda.is_available() and device_str == 'cuda':
         device = torch.device("cuda")
-        print(f"✅ GPU Active: {torch.cuda.get_device_name(0)}")
+        print(f"GPU Active: {torch.cuda.get_device_name(0)}")
     else:
         device = torch.device("cpu")
-        print("⚠️ Running on CPU")
+        print("Running on CPU")
 
     data_dir = cfg['dataset'].get('data_dir', 'data/adult')
     config_path = os.path.join(data_dir, "config.json")
@@ -83,20 +140,24 @@ def main():
             k=cfg['dataset']['k_neighbors'],
             device=device,
             scaler=train_dataset.scaler, 
-            ohe=train_dataset.ohe,       
+            ordinal_encoder=train_dataset.ordinal_encoder,      
             build_neighbors=False        
         )
 
     clf_model = None
+    clf_flat = None
     if 'classifier' in cfg and cfg['classifier'].get('train'):
         print("\n=== Training Classifier ===")
         clf_model = train_classifier(train_dataset, cfg['classifier'], device, val_dataset)
-        clf_model.eval()
+        train_dataset.relabel(clf_model, device=device)
+        
+        clf_flat = ClfFlatWrapper(clf_model, train_dataset.num_numerical)
 
-    print("\n=== Training Diffusion ===")
+    print("\n=== Training Diffusion (TabDiff) ===")
     trained_diffusion = train(cfg, train_dataset)
     trained_diffusion.eval()
-    print("\n=== Generating Counterfactuals (Standard Sampling) ===")
+    
+    print("\n=== Generating Counterfactuals (SDEdit) ===")
     
     NUM_TEST = cfg['dataset'].get('n_test_samples', 500)
     N_CF_PER_SAMPLE = cfg['dataset'].get('n_cf_per_sample', 10) 
@@ -106,86 +167,98 @@ def main():
         X=X_test_raw[indices], y=y_test[indices], spec=spec,
         device=device,
         scaler=train_dataset.scaler, 
-        ohe=train_dataset.ohe,
+        ordinal_encoder=train_dataset.ordinal_encoder,
         build_neighbors=False
     )
     
-    x_orig = test_dataset_helper.X_model 
+    x_num_orig = test_dataset_helper.X_num
+    x_cat_orig = test_dataset_helper.X_cat
+    x_orig_flat = test_dataset_helper.X_model 
+    
     y_test_tensor = test_dataset_helper.y
     y_target = torch.clamp((y_test_tensor + 1) % 2, 0, 1)
-
-    x_input_expanded = x_orig.repeat_interleave(N_CF_PER_SAMPLE, dim=0)
+    x_num_expanded = x_num_orig.repeat_interleave(N_CF_PER_SAMPLE, dim=0)
+    x_cat_expanded = x_cat_orig.repeat_interleave(N_CF_PER_SAMPLE, dim=0)
+    x_flat_expanded = x_orig_flat.repeat_interleave(N_CF_PER_SAMPLE, dim=0)
     y_input_expanded = y_target.repeat_interleave(N_CF_PER_SAMPLE, dim=0)
 
-    print(f"Test Samples: {len(x_orig)}")
+    print(f"Test Samples: {len(x_orig_flat)}")
     print(f"CF per Sample: {N_CF_PER_SAMPLE}")
-    print(f"Total Batch Size: {x_input_expanded.shape[0]}")
+    print(f"Total Batch Size: {x_flat_expanded.shape[0]}")
 
-    # --- SAMPLOWANIE (BEZ SVDD) ---
     with torch.no_grad():
-        final_cfs = trained_diffusion.sample(
-            x_orig=x_input_expanded,       
-            y_target=y_input_expanded,     
-            temperature=1.0,
-            guidance_scale=10.0
+        cond_cat_parts = []
+        if x_cat_expanded.shape[1] > 0:
+            for i, card in enumerate(train_dataset.cat_cardinalities):
+                oh = F.one_hot(x_cat_expanded[:, i].long(), num_classes=card+1).float()
+                cond_cat_parts.append(oh)
+            cond_cat_soft = torch.cat(cond_cat_parts, dim=-1)
+        else:
+            cond_cat_soft = torch.empty(x_num_expanded.shape[0], 0, device=device)
+            
+        y_classes = max(2, train_dataset.num_classes_target)
+        cond_y_soft = F.one_hot(y_input_expanded.long(), num_classes=y_classes).float()
+
+        trained_diffusion.set_condition(x_num_expanded, cond_cat_soft, cond_y_soft)
+        z_norm_cf, z_cat_cf = sample_counterfactuals_tabdiff(
+            diffusion_model=trained_diffusion,
+            x_num_orig=x_num_expanded,
+            x_cat_orig=x_cat_expanded,
+            noise_level=0.6 
         )
+        
+        final_cfs = tabdiff_to_flat_tensor(z_norm_cf, z_cat_cf, train_dataset.cat_cardinalities)
     
-    group_ids = np.arange(len(x_orig)).repeat(N_CF_PER_SAMPLE)
+    group_ids = np.arange(len(x_orig_flat)).repeat(N_CF_PER_SAMPLE)
     X_train_np_inv = train_dataset.inverse_transform(train_dataset.X_model)
-    print("\n=== Calculating Metrics ===")
+    
     evaluator = MetricsEvaluator(train_dataset)
     metrics = evaluator.evaluate(
-        x_orig_tensor=x_input_expanded, 
+        x_orig_tensor=x_flat_expanded, 
         x_cf_tensor=final_cfs,     
         y_target_tensor=y_input_expanded,
         cf_group_ids=group_ids,
-        X_train_np=train_dataset.inverse_transform(train_dataset.X_model),
-        clf_model=clf_model  
+        X_train_np=X_train_np_inv,
+        clf_model=clf_flat 
     )
 
-    print("\n=== Generowanie CF (kNN Baseline) ===")
     final_cfs_knn = generate_knn_counterfactuals(
-        x_orig, # Przekazujemy NIErozszerzone dane wejściowe!
+        x_orig_flat, 
         y_target, 
         train_dataset, 
+        clf_model=clf_flat,
         k_neighbors=N_CF_PER_SAMPLE
     )
 
-    print("Obliczanie Metryk (kNN)...")
     metrics_knn = evaluator.evaluate(
-        x_orig_tensor=x_input_expanded, # Używamy rozszerzonych oryginałów do metryk
+        x_orig_tensor=x_flat_expanded, 
         x_cf_tensor=final_cfs_knn,     
         y_target_tensor=y_input_expanded,
         cf_group_ids=group_ids,
         X_train_np=X_train_np_inv,
-        clf_model=clf_model  
+        clf_model=clf_flat  
     )
-    # --- 3. WYDRUK I ZAPIS DO PLIKU ---
+
     all_keys = sorted(list(set(metrics.keys()).union(set(metrics_knn.keys()))))
 
     for k in all_keys:
         val_diff = metrics.get(k, 0.0)
         val_knn = metrics_knn.get(k, 0.0)
-        print(f"{k:>15} | Dyfuzja: {val_diff:<8.4f} | kNN: {val_knn:<8.4f}")
+        print(f"{k:>15} | Diffusion: {val_diff:<8.4f} | kNN: {val_knn:<8.4f}")
 
-    # Zapis do pliku CSV dla późniejszej analizy
     run_name = cfg.get("run_name", None)
     results_file = f"metrics_comparison_{run_name}.csv" if run_name else "metrics_comparison.csv"
     file_exists = os.path.isfile(results_file)
 
-    row_data = {"Model": ["Diffusion", "kNN"]}
+    row_data = {"Model": ["TabDiff", "kNN"]}
     for k in all_keys:
         row_data[k] = [metrics.get(k, 0.0), metrics_knn.get(k, 0.0)]
         
     df_res = pd.DataFrame(row_data)
     df_res.to_csv(results_file, mode='a', header=not file_exists, index=False)
-    print(f"\n[INFO] Wyniki dopisane do pliku: {results_file}")
-    
-    for k, v in metrics.items():
-        print(f"{k:<30}: {v:.4f}")
-
     wandb.log(metrics)
-    x_orig_plot = train_dataset.inverse_transform(x_input_expanded)
+    
+    x_orig_plot = train_dataset.inverse_transform(x_flat_expanded)
     x_cf_plot = train_dataset.inverse_transform(final_cfs)
 
     save_path = os.path.join(cfg['train']['output_dir'], f"{cfg.get('project_name', 'run')}_metrics.pt")

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 import copy
@@ -15,7 +16,7 @@ class SimpleMLP(nn.Module):
         for h_dim in hidden_layers:
             layers.append(nn.Linear(in_dim, h_dim))
             layers.append(nn.ReLU())
-            layers.append(nn.Dropout(0.2)) # Dropout pomaga w generalizacji
+            layers.append(nn.Dropout(0.2))
             in_dim = h_dim
             
         layers.append(nn.Linear(in_dim, output_dim))
@@ -23,6 +24,27 @@ class SimpleMLP(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+class ClassifierOHEWrapper(nn.Module):
+    def __init__(self, base_classifier: nn.Module, cat_cardinalities: list):
+        super().__init__()
+        self.base_classifier = base_classifier
+        self.cat_cardinalities = cat_cardinalities
+
+    def forward(self, x_num: torch.Tensor, x_cat: torch.Tensor) -> torch.Tensor:
+        cat_parts = []
+        if x_cat is not None and x_cat.shape[1] > 0:
+            for i, card in enumerate(self.cat_cardinalities):
+                idx_col = x_cat[:, i].long()
+                oh = F.one_hot(idx_col, num_classes=card).float()
+                cat_parts.append(oh)
+        
+        if len(cat_parts) > 0:
+            x_flat = torch.cat([x_num] + cat_parts, dim=-1)
+        else:
+            x_flat = x_num
+            
+        return self.base_classifier(x_flat)
 
 def train_classifier(
     train_dataset, 
@@ -33,7 +55,6 @@ def train_classifier(
     batch_size = clf_config.get('batch_size', 64)
     
     if val_dataset is None:
-        print("[Classifier] No validation set provided. Splitting train set (80/20).")
         total_len = len(train_dataset)
         val_len = int(0.2 * total_len)
         train_len = total_len - val_len
@@ -45,12 +66,11 @@ def train_classifier(
         train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False)
     else:
-        print("[Classifier] Using provided validation set.")
         y_train_tensor = train_dataset.y
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-    input_dim = train_dataset.X_model.shape[1]
+    input_dim = train_dataset.num_numerical + sum(train_dataset.cat_cardinalities)
     output_dim = max(2, train_dataset.num_classes_target) 
     
     hidden_layers = clf_config.get('hidden_layers', [64, 64])
@@ -58,7 +78,9 @@ def train_classifier(
     epochs = clf_config.get('epochs', 200)
     patience = clf_config.get('patience', 15)
 
-    model = SimpleMLP(input_dim, hidden_layers, output_dim).to(device)
+    base_model = SimpleMLP(input_dim, hidden_layers, output_dim)
+    model = ClassifierOHEWrapper(base_model, train_dataset.cat_cardinalities).to(device)
+    
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
     class_counts = torch.bincount(y_train_tensor)
@@ -83,19 +105,21 @@ def train_classifier(
         train_loss = 0.0
         for batch in train_loader:
             if isinstance(batch, dict):
-                bx = batch['x_orig'].to(device) 
+                bx_num = batch['x_num_orig'].to(device) 
+                bx_cat = batch['x_cat_orig'].to(device)
                 by = batch['y'].to(device)
-            elif isinstance(batch, list):
-                bx, by = batch[0].to(device), batch[1].to(device)
+            else:
+                raise ValueError("No dictionary")
             
             optimizer.zero_grad()
-            logits = model(bx)
+            logits = model(bx_num, bx_cat)
             loss = criterion(logits, by)
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
         
         avg_train_loss = train_loss / len(train_loader)
+        
         model.eval()
         val_loss = 0.0
         all_preds = []
@@ -104,13 +128,11 @@ def train_classifier(
 
         with torch.no_grad():
             for batch in val_loader:
-                if isinstance(batch, dict):
-                    bx = batch['x_orig'].to(device)
-                    by = batch['y'].to(device)
-                else:
-                    bx, by = batch[0].to(device), batch[1].to(device)
+                bx_num = batch['x_num_orig'].to(device)
+                bx_cat = batch['x_cat_orig'].to(device)
+                by = batch['y'].to(device)
 
-                logits = model(bx)
+                logits = model(bx_num, bx_cat)
                 loss = criterion(logits, by)
                 val_loss += loss.item()
                 
@@ -143,6 +165,7 @@ def train_classifier(
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
+            
         if (epoch + 1) % 10 == 0:
             print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.4f} | "
                   f"Val Loss: {avg_val_loss:.4f} | Acc: {val_acc:.4f} | F1: {val_f1:.4f} | AUC: {val_auc:.4f}")
@@ -150,6 +173,7 @@ def train_classifier(
         if epochs_no_improve >= patience:
             print(f"[Classifier] Early stopping triggered at epoch {epoch+1}.")
             break
+            
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
         print("[Classifier] Restored best model state.")

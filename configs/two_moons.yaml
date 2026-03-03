@@ -1,54 +1,36 @@
 project_name: "tabdce-diffusion" 
-run_name: "two-moons-TabSyn-dpp"
+run_name: "two-moons-TabDiff-SDEdit"
 
 dataset:
   name: "two_moons"
   data_dir: "data/two_moons"  
   n_samples: 1000
-  noise: 0.1
   k_neighbors: 20
-  search_method: "knn"
-  scaler: "standard"  #"quantile" , "standard"
+  search_method: "dpp"
+  scaler: "standard"  # Upewnij się, że w run_tabsyn.py przekazujesz: scaler_type=cfg['dataset'].get('scaler', 'standard')
+  n_test_samples: 200
+  n_cf_per_sample: 10
 
 classifier:
   train: true           
-  relabel: true         
-  hidden_layers: [64, 32] 
+  hidden_layers: [32, 32] 
   lr: 0.001
   epochs: 100
   batch_size: 64
 
 diffusion:
-  T: 50
-  schedule: "cosine"
-
-vae:
-  latent_dim: 2
-  hidden_dims: [16, 16]
-  lr: 0.0001
-  epochs: 250
-  vae_path: "checkpoints/two_moons_2dim_2.pt"       # Skąd ma próbować wczytać
-  vae_save_path: "checkpoints/two_moons_2dim_2.pt"
+  T: 50 
 
 model:
-  hidden_dim: 32
-  depth: 2
-  dropout: 0.0
+  num_layers: 2      # Podbijamy do 4. Dajemy sieci czas na przemyślenie ruchu.
+  d_token: 16        # [KLUCZOWE] Zwiększamy z 8 na 32. Punkty wreszcie będą miały rozdzielczość, by trafić w dystrybucję.
+  n_head: 2          # 4 głowy atencji - model szybciej skojarzy współrzędne z warunkiem klasy.
+  dim_t: 64       # [KLUCZOWE] Dyfuzja musi mieć szerokie gardło dla czasu t! W oryginalnych pracach to zazwyczaj 256 lub 512. My dajemy solidne 128.
+  factor: 5          # Mnożnik dla warstwy FeedForward (d_token * factor)
 
 train:
-  batch_size: 16
-  lr: 0.0005
-  epochs: 500
+  batch_size: 32
+  lr: 0.001
+  epochs: 2500
   device: "cuda"
   output_dir: "checkpoints_const"
-
-svdd:
-  n_candidates: 50
-  guidance_scale: 20.0
-  dist_scale: 0.1
-  cat_scale: 0.0
-  temperature: 2.0
-
-eval:
-  n_test_samples: 200
-  n_cf_per_sample: 10

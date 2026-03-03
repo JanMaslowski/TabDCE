@@ -9,6 +9,8 @@ ENV/
 wandb/
 checkpoints/
 notebooks/
+outputs/
+thrash/
 
 .DS_Store
 .env
