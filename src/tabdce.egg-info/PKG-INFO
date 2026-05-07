@@ -1,0 +1,44 @@
+Metadata-Version: 2.4
+Name: tabdce
+Version: 0.1.0
+Summary: Counterfactual explainations with diffusion model
+Author: Jan Maslowski
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.0.0
+Requires-Dist: numpy>=1.24
+Requires-Dist: scikit-learn>=1.3
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: tqdm>=4.66
+Requires-Dist: seaborn>=0.13.2
+Requires-Dist: wandb>=0.16.0
+Provides-Extra: dev
+Requires-Dist: jupyter>=1.1.1; extra == "dev"
+Requires-Dist: ipykernel>=7.1.0; extra == "dev"
+Requires-Dist: matplotlib>=3.10.7; extra == "dev"
+
+TABDCE/
+├── README.md
+├── pyproject.toml  
+├── configs/
+│   └── two_moons.yaml
+├── scripts/
+│   └── run.py
+├── notebooks/
+│   └── visualize.py       
+└── src/
+    ├── datasets/
+    │   └── dataset.py
+    ├── loops/
+    │   └── train.py    
+    ├── models/
+    │   ├── denoise_fn.py
+    │   └── diffusion.py
+    └── utils/
+        └── metrics.py
+
+
+
+poetry run python scripts/run.py --config configs/two_moons.yaml
+
+export WANDB_API_KEY="cc894b19e7dc78f1805ec60df86959074051a1bc"

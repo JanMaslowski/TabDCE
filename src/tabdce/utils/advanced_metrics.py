@@ -9,43 +9,91 @@ class Metric:
 
 
 class ProximityContinuousL1(Metric):
-
-    def __call__(self, x_orig_tensor, x_cf_tensor, num_numerical, **kwargs):
-        if num_numerical == 0: 
+    def __call__(self, x_orig_tensor, x_cf_tensor, num_numerical, cf_group_ids_valid, **kwargs):
+        if num_numerical == 0 or len(x_cf_tensor) == 0: 
             return 0.0
+        
         x_o = x_orig_tensor[:, :num_numerical]
         x_c = x_cf_tensor[:, :num_numerical]
-        l1_dist = (x_o - x_c).abs().mean()
-        return float(l1_dist.item())
+        cf_group_ids = np.asarray(cf_group_ids_valid)
+        unique_groups = np.unique(cf_group_ids)
+        
+        group_scores = []
+        for group_id in unique_groups:
+            idx = np.where(cf_group_ids == group_id)[0]
+            grp_l1 = (x_o[idx] - x_c[idx]).abs().mean().item()
+            group_scores.append(grp_l1)
+            
+        return float(np.mean(group_scores))
 
 class SparsityCategorical(Metric):
-
-    def __call__(self, X_test_valid, X_cf_valid, categorical_features, **kwargs):
+    def __call__(self, X_test_valid, X_cf_valid, categorical_features, cf_group_ids_valid, **kwargs):
         if len(X_test_valid) == 0 or not categorical_features: 
             return 0.0
         
         D_cat = len(categorical_features)
         X_orig_cat = X_test_valid[:, categorical_features]
         X_cf_cat = X_cf_valid[:, categorical_features]
-        diff_count = (X_orig_cat != X_cf_cat).sum(axis=1)
-        return float(np.mean(diff_count / D_cat))
+        
+        cf_group_ids = np.asarray(cf_group_ids_valid)
+        unique_groups = np.unique(cf_group_ids)
+        
+        group_scores = []
+        for group_id in unique_groups:
+            idx = np.where(cf_group_ids == group_id)[0]
+            diff_count = (X_orig_cat[idx] != X_cf_cat[idx]).sum(axis=1)
+            grp_sparsity = np.mean(diff_count / D_cat)
+            group_scores.append(grp_sparsity)
+            
+        return float(np.mean(group_scores))
 
 class EpsilonSparsity(Metric):
-
-    def __call__(self, X_test_valid, X_cf_valid, continuous_features, ranges, **kwargs):
+    def __call__(self, X_test_valid, X_cf_valid, continuous_features, ranges, cf_group_ids_valid, **kwargs):
         if len(X_test_valid) == 0 or not continuous_features: 
             return 0.0
         
         epsilon = 0.05
         D_num = len(continuous_features)
-        
         X_orig_cont = X_test_valid[:, continuous_features].astype(float)
         X_cf_cont = X_cf_valid[:, continuous_features].astype(float)
+        
         abs_diff = np.abs(X_orig_cont - X_cf_cont)
         thresholds = epsilon * ranges.reshape(1, -1)
         significant_changes = (abs_diff > thresholds).astype(float)
-        return float(np.mean(np.sum(significant_changes, axis=1) / D_num))
+        
+        cf_group_ids = np.asarray(cf_group_ids_valid)
+        unique_groups = np.unique(cf_group_ids)
+        
+        group_scores = []
+        for group_id in unique_groups:
+            idx = np.where(cf_group_ids == group_id)[0]
+            grp_eps_spars = np.mean(np.sum(significant_changes[idx], axis=1) / D_num)
+            group_scores.append(grp_eps_spars)
+            
+        return float(np.mean(group_scores))
 
+class LocalOutlierFactorMetric(Metric):
+    def __init__(self, X_train_encoded):
+        self.lof = LocalOutlierFactor(n_neighbors=20, novelty=True)
+        self.lof.fit(X_train_encoded)
+
+    def __call__(self, x_cf_tensor, cf_group_ids_valid, **kwargs):
+        if len(x_cf_tensor) == 0: 
+            return 0.0
+        
+        X_cf = x_cf_tensor.cpu().numpy()
+        raw_scores = np.log(-self.lof.score_samples(X_cf) + 1e-8)
+        
+        cf_group_ids = np.asarray(cf_group_ids_valid)
+        unique_groups = np.unique(cf_group_ids)
+        
+        group_scores = []
+        for group_id in unique_groups:
+            idx = np.where(cf_group_ids == group_id)[0]
+            grp_lof = np.median(raw_scores[idx])
+            group_scores.append(grp_lof)
+            
+        return float(np.mean(group_scores))
 
 class DiversityMixed(Metric):
 
@@ -59,18 +107,21 @@ class DiversityMixed(Metric):
         D_num = num_numerical
         D_cat = len(categorical_features)
         D_total = D_num + D_cat
-        if D_total == 0: return 0.0
+        if D_total == 0: 
+            return 0.0
 
         group_diversities = []
-        
         X_num = x_cf_tensor[:, :num_numerical].cpu().numpy()
         X_cat = x_cf_valid_raw[:, categorical_features]
 
         for group_id in unique_groups:
             indices = np.where(cf_group_ids == group_id)[0]
-            if len(indices) < 2: 
-                continue
+            K = len(indices)
             
+            if K < 2: 
+                group_diversities.append(0.0)
+                continue
+
             if D_num > 0:
                 grp_num = X_num[indices]
                 dists_num = pdist(grp_num, metric='cityblock')
@@ -80,7 +131,7 @@ class DiversityMixed(Metric):
             if D_cat > 0:
                 grp_cat = X_cat[indices]
                 grp_cat_encoded = np.zeros(grp_cat.shape, dtype=int)
-                for c in range(grp_cat.shape[1]):
+                for c in range(D_cat):
                     _, encoded = np.unique(grp_cat[:, c], return_inverse=True)
                     grp_cat_encoded[:, c] = encoded
                 
@@ -89,14 +140,13 @@ class DiversityMixed(Metric):
                 dists_cat = 0.0
             
             mixed_dists = dists_num + dists_cat
-            if mixed_dists.size > 0:
-                group_diversities.append(np.mean(mixed_dists) / D_total)
+            div_i = np.mean(mixed_dists) / D_total
+            group_diversities.append(div_i)
 
         if not group_diversities: 
             return 0.0
             
         return float(np.mean(group_diversities))
-
 class LocalOutlierFactorMetric(Metric):
     def __init__(self, X_train_encoded):
         self.lof = LocalOutlierFactor(n_neighbors=20, novelty=True)

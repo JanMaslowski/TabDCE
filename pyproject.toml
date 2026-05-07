@@ -7,7 +7,7 @@ name = "tabdce"
 version = "0.1.0"
 description = "Counterfactual explainations with diffusion model"
 authors = [
-    {name = "Jan Maslowski"}
+    {name = "-"}
 ]
 readme = "README.md"
 requires-python = ">=3.11"

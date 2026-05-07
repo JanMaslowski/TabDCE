@@ -1,39 +1,37 @@
-project_name: "tabdce-diffusion"
-run_name: "lendin-club-run_dpp"
+project_name: "DICTUM"
+run_name: "DICTUM_lending_club"
 
 dataset:
   name: "lending-club"
   data_dir: "data/lending-club"  
-  n_samples: 10000
-  noise: 0.1
-  k_neighbors: 50
+  n_samples: 20000
+  k_neighbors: 150
   search_method: "dpp"
-  scaler: "standard"
+  scaler: "standard"  
+  n_test_samples: 2000
+  n_cf_per_sample: 10
+  dpp_m: 0.5
 
 classifier:
   train: true           
-  relabel: true         
-  hidden_layers: [30, 30] 
+  hidden_layers: [32, 32] 
   lr: 0.001
   epochs: 100
   batch_size: 64
 
 diffusion:
-  T: 200
-  schedule: "cosine"
+  T: 50
 
 model:
-  hidden_dim: 256
-  depth: 3
-  dropout: 0.0
+  num_layers: 4
+  d_token: 4
+  n_head: 1
+  dim_t: 256
+  factor: 32
 
 train:
-  batch_size: 32
+  batch_size: 512
   lr: 0.001
-  epochs: 2500
+  epochs: 4000
   device: "cuda"
-  output_dir: "checkpoints_const"
-
-eval:
-  n_test_samples: 1000
-  n_cf_per_sample: 10
+  output_dir: "checkpoints_lending_club"

@@ -1,0 +1,88 @@
+project_name: "DICTUM"
+run_name: "DICTUM_constraints"
+results_path: "checkpoints_default/constraints_results.csv"  # <--- TUTAJ ZMIENIASZ ŚCIEŻKĘ ZAPISU
+
+dataset:
+  data_dir: "data/default"
+  n_samples: 2000        
+  n_test_samples: 2000
+  n_cf_per_sample: 100
+  k_neighbors: 15
+
+classifier:
+  train: false
+  epochs: 0
+  lr: 0.001
+  weight_decay: 0.0001
+  hidden_dim: 32
+
+diffusion:
+  T: 50
+  checkpoint_path: "checkpoints_default_BASELINE_DPP_XL/tabdce-diffusion_metrics.pt"
+
+new_mlp:
+  train: true
+  epochs: 100
+  lr: 0.001
+  weight_decay: 0.0001
+  hidden_dim: 32     
+
+svdd_experiments:
+
+  - name: "Level_0"
+    clf_guidance: "nn"
+    K: 5
+    guidance_scale: 15.0
+    dist_scale: 0.1
+    cat_scale: 0.0
+    constraint_weight: 500.0
+    immutable_num_idx: [] 
+    immutable_cat_idx: [] 
+    increasing_num_idx: [] 
+    increasing_cat_idx: []
+  - name: "Level_1"
+    clf_guidance: "nn"
+    K: 5
+    guidance_scale: 15.0
+    dist_scale: 0.1
+    cat_scale: 0.0
+    constraint_weight: 500.0
+    immutable_num_idx: [] # + Fnlwgt
+    immutable_cat_idx: [0, 2] # Wszystkie kategorie zablokowane z wyjątkiem np. zawodu
+    increasing_num_idx: [] # Edukacja może tylko rosnąć
+    increasing_cat_idx: []
+
+  - name: "Level_2"
+    clf_guidance: "nn"
+    K: 5
+    guidance_scale: 15.0
+    dist_scale: 0.1
+    cat_scale: 0.0
+    constraint_weight: 500.0
+    immutable_num_idx: []
+    immutable_cat_idx: [0, 2] 
+    increasing_num_idx: [1] 
+    increasing_cat_idx: [1]
+  - name: "Level_3"
+    clf_guidance: "nn"
+    K: 5
+    guidance_scale: 15.0
+    dist_scale: 0.1
+    cat_scale: 0.0
+    constraint_weight: 500.0
+    immutable_num_idx: [] 
+    immutable_cat_idx: [0, 2] 
+    increasing_num_idx: [1] 
+    increasing_cat_idx: [1,3,4]
+
+  - name: "Level_4"
+    clf_guidance: "nn"
+    K: 5
+    guidance_scale: 15.0
+    dist_scale: 0.1
+    cat_scale: 0.0
+    constraint_weight: 500.0
+    immutable_num_idx: [2,3,4,5,6,7] 
+    immutable_cat_idx: [0, 2] 
+    increasing_num_idx: [1] 
+    increasing_cat_idx: [1,3,4,5,6,7,8]

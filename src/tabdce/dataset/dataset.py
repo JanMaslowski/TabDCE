@@ -5,7 +5,7 @@ import os
 import pandas as pd
 import numpy as np
 import torch
-from torch.utils.data import Dataset,DataLoader
+from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import QuantileTransformer, StandardScaler, OrdinalEncoder
 
 @dataclass
@@ -14,6 +14,7 @@ class TabularSpec:
     cat_idx: List[int]
     target_col: str = None 
     cat_cardinalities: List[int] = None
+    global_categories: List[np.ndarray] = None 
 
 class TabularCounterfactualDataset(Dataset):
     def __init__(
@@ -23,14 +24,15 @@ class TabularCounterfactualDataset(Dataset):
         spec: TabularSpec,
         k: int = 15,
         search_method: Literal["knn", "dpp"] = "knn",
-        dpp_pool_factor: int = 3,
+        dpp_pool_factor: int = 5,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
         scaler_type="quantile",
         scaler: object | None = None,
         ordinal_encoder: OrdinalEncoder | None = None,
         build_neighbors: bool = True,
-        gower_weight: float = 1.0,
+        gower_weight: float = 0.75,
+        dpp_m=0.5,
     ) -> None:
         super().__init__()
 
@@ -41,7 +43,7 @@ class TabularCounterfactualDataset(Dataset):
         self.search_method = search_method
         self.dpp_pool_factor = dpp_pool_factor
         self.gower_weight = gower_weight
-
+        self.dpp_m = dpp_m
         self.y = y.long().to(device) if isinstance(y, torch.Tensor) else torch.from_numpy(y).long().to(device)
         self.num_classes_target = len(torch.unique(self.y))
         
@@ -49,6 +51,7 @@ class TabularCounterfactualDataset(Dataset):
         N = X_np.shape[0]
 
         self.num_numerical = len(spec.num_idx)
+        
         if self.num_numerical > 0:
             X_num_np = X_np[:, spec.num_idx].astype(np.float32)
             if scaler is not None:
@@ -64,11 +67,16 @@ class TabularCounterfactualDataset(Dataset):
         if len(spec.cat_idx) > 0:
             X_cat_np = X_np[:, spec.cat_idx]
             if ordinal_encoder is None:
-                self.ordinal_encoder = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+                if hasattr(spec, 'global_categories') and spec.global_categories is not None:
+                    self.ordinal_encoder = OrdinalEncoder(categories=spec.global_categories)
+                else:
+                    self.ordinal_encoder = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1)
+                
                 X_cat_idx = self.ordinal_encoder.fit_transform(X_cat_np).astype(np.int64)
             else:
                 self.ordinal_encoder = ordinal_encoder
                 X_cat_idx = self.ordinal_encoder.transform(X_cat_np).astype(np.int64)
+                
             self.cat_cardinalities = [len(cats) for cats in self.ordinal_encoder.categories_]
         else:
             self.ordinal_encoder = None
@@ -84,7 +92,6 @@ class TabularCounterfactualDataset(Dataset):
         self.X_model = torch.from_numpy(X_model_np).to(device).to(dtype)
 
         self.neigh_idx = self._build_opposite_class_neighbors(self.X_model, self.y, k=self.k) if build_neighbors else None
-
 
     def _build_opposite_class_neighbors(self, X_model: torch.Tensor, y: torch.Tensor, k: int) -> torch.Tensor:
         N = X_model.size(0)
@@ -117,6 +124,7 @@ class TabularCounterfactualDataset(Dataset):
                     chosen = candidates_global[:, :k]
                 elif self.search_method == "dpp":
                     chosen = self._select_dpp_greedy_fast(X_model[src_idx], X_model[candidates_global], candidates_global, k)
+                
                 if chosen.size(1) < k:
                     chosen = torch.cat([chosen, chosen[:, -1:].repeat(1, k - chosen.size(1))], dim=1)
 
@@ -127,33 +135,60 @@ class TabularCounterfactualDataset(Dataset):
     def _select_dpp_greedy_fast(self, query_feats, cand_feats, cand_indices, k):
         B, Pool, F = cand_feats.shape
         if Pool <= k: return cand_indices
-        sigma_q, sigma_s = 1.0, 5.0
-        device = cand_feats.device
-        dist_qc = torch.cdist(query_feats.unsqueeze(1), cand_feats).squeeze(1) ** 2
-        Q = torch.exp(-dist_qc / sigma_q)
-        norm_c = (cand_feats ** 2).sum(dim=2, keepdim=True)
-        dist_cc = norm_c + norm_c.transpose(1, 2) - 2 * torch.bmm(cand_feats, cand_feats.transpose(1, 2))
-        S = torch.exp(-dist_cc / sigma_s) + torch.eye(Pool, device=device).unsqueeze(0) * 1e-4
-        L = S * (Q.unsqueeze(2) * Q.unsqueeze(1))
         
-        selected_indices_local = torch.zeros((B, k), dtype=torch.long, device=device)
-        K = L.clone()
-        mask = torch.zeros((B, Pool), dtype=torch.bool, device=device)
+        device = cand_feats.device
+        final_selected = torch.zeros((B, k), dtype=torch.long, device=device)
+        chunk_size = 1000 
+        m = getattr(self, 'dpp_m', 0.5) 
+        sigma = 5.0
+        weight_q = m * sigma
+        weight_c = (1.0 - m) * sigma
+        
+        for i in range(0, B, chunk_size):
+            end = min(i + chunk_size, B)
+            b_chunk = end - i
+            
+            q_chunk = query_feats[i:end]
+            c_chunk = cand_feats[i:end]
+            idx_chunk = cand_indices[i:end]
+            
+            dist_qc = torch.cdist(q_chunk.unsqueeze(1), c_chunk).squeeze(1) ** 2
+            max_dist_qc = dist_qc.max(dim=1, keepdim=True).values
+            dist_qc_scaled = dist_qc / (max_dist_qc + 1e-8)
+            
+            Q = torch.exp(-dist_qc_scaled * weight_q)
 
-        for step in range(k):
-            diags = torch.diagonal(K, dim1=1, dim2=2)
-            gains = diags.clone()
-            gains[mask] = -float('inf')
-            best_idx = torch.argmax(gains, dim=1)
-            selected_indices_local[:, step] = best_idx
-            mask.scatter_(1, best_idx.unsqueeze(1), True)
-            if step < k - 1:
-                best_idx_view = best_idx.view(B, 1, 1).expand(B, Pool, 1)
-                v = K.gather(2, best_idx_view)
-                d = v.gather(1, best_idx.view(B, 1, 1)).squeeze(2)
-                K = K - torch.bmm(v, v.transpose(1, 2)) / (d.unsqueeze(2) + 1e-6)
-        return torch.gather(cand_indices, 1, selected_indices_local)
+            norm_c = (c_chunk ** 2).sum(dim=2, keepdim=True)
+            dist_cc = norm_c + norm_c.transpose(1, 2) - 2 * torch.bmm(c_chunk, c_chunk.transpose(1, 2))
+            
+            max_dist_cc = dist_cc.view(b_chunk, -1).max(dim=1).values.view(b_chunk, 1, 1)
+            dist_cc_scaled = dist_cc / (max_dist_cc + 1e-8)
+            
+            S = torch.exp(-dist_cc_scaled * weight_c) + torch.eye(Pool, device=device).unsqueeze(0) * 1e-4
+ 
+            L = S * (Q.unsqueeze(2) * Q.unsqueeze(1))
+            selected_local = torch.zeros((b_chunk, k), dtype=torch.long, device=device)
+            K = L.clone()
+            mask = torch.zeros((b_chunk, Pool), dtype=torch.bool, device=device)
 
+            for step in range(k):
+                diags = torch.diagonal(K, dim1=1, dim2=2)
+                gains = diags.clone()
+                gains[mask] = -float('inf')
+                best_idx = torch.argmax(gains, dim=1)
+                selected_local[:, step] = best_idx
+                mask.scatter_(1, best_idx.unsqueeze(1), True)
+                if step < k - 1:
+                    best_idx_view = best_idx.view(b_chunk, 1, 1).expand(b_chunk, Pool, 1)
+                    v = K.gather(2, best_idx_view)
+                    d = v.gather(1, best_idx.view(b_chunk, 1, 1)).squeeze(2)
+                    K = K - torch.bmm(v, v.transpose(1, 2)) / (d.unsqueeze(2) + 1e-6)
+                    
+            final_selected[i:end] = torch.gather(idx_chunk, 1, selected_local)
+            
+        return final_selected
+            
+        return final_selected
     def __len__(self) -> int:
         return self.X_num.size(0)
 
@@ -225,9 +260,10 @@ class TabularCounterfactualDataset(Dataset):
         self.y = torch.cat(all_preds, dim=0)
         
         counts = torch.bincount(self.y.long())
-        print(f"[Dataset]  New class distribution: {counts.tolist()}")
+        print(f"[Dataset] New class distribution: {counts.tolist()}")
         if hasattr(self, 'k') and getattr(self, 'build_neighbors', False):
-            self._build_opposite_class_neighbors()
+            self.neigh_idx = self._build_opposite_class_neighbors(self.X_model, self.y, k=self.k)
+
 
 def get_generic_data(data_dir: str, data_config: dict):
     train_path = os.path.join(data_dir, "train.csv")
@@ -253,6 +289,7 @@ def get_generic_data(data_dir: str, data_config: dict):
         df_full = pd.concat([df_train, df_val, df_test], ignore_index=True)
     else:
         df_full = pd.concat([df_train, df_test], ignore_index=True)
+        
     num_cols = data_config.get("numerical_columns", [])
     cat_cols = data_config.get("categorical_columns", [])
     target_col = data_config.get("target_column")
@@ -288,10 +325,17 @@ def get_generic_data(data_dir: str, data_config: dict):
     X_cat = df_full[valid_cat].to_numpy()
     X_final = np.concatenate([X_num, X_cat], axis=1)
 
+    global_categories = []
+    if len(valid_cat) > 0:
+        for i in range(len(valid_cat)):
+            unique_vals = np.unique(X_cat[:, i])
+            global_categories.append(unique_vals)
+
     spec = TabularSpec(
         num_idx=list(range(len(valid_num))),
         cat_idx=list(range(len(valid_num), len(valid_num) + len(valid_cat))),
-        target_col=target_col
+        target_col=target_col,
+        global_categories=global_categories
     )
     
     mask_train = (df_full['split'] == 'train').values

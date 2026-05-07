@@ -1,15 +1,16 @@
-project_name: "tabdce-diffusion" 
-run_name: "adult-TabSyn-AE"
+project_name: "DICTUM" 
+run_name: "DICTUM_adult"
 
 dataset:
   name: "adult"
   data_dir: "data/adult"  
-  n_samples: 1000
-  k_neighbors: 20
+  n_samples: 20000
+  k_neighbors: 150
   search_method: "dpp"
-  scaler: "standard"  # Upewnij się, że w run_tabsyn.py przekazujesz: scaler_type=cfg['dataset'].get('scaler', 'standard')
-  n_test_samples: 200
+  scaler: "standard"
+  n_test_samples: 2000
   n_cf_per_sample: 10
+  dpp_m: 0.5
 
 classifier:
   train: true           
@@ -22,15 +23,15 @@ diffusion:
   T: 50
 
 model:
-  num_layers: 4      # Podbijamy do 4. Dajemy sieci czas na przemyślenie ruchu.
-  d_token: 16        # [KLUCZOWE] Zwiększamy z 8 na 32. Punkty wreszcie będą miały rozdzielczość, by trafić w dystrybucję.
-  n_head: 4          # 4 głowy atencji - model szybciej skojarzy współrzędne z warunkiem klasy.
-  dim_t: 64       # [KLUCZOWE] Dyfuzja musi mieć szerokie gardło dla czasu t! W oryginalnych pracach to zazwyczaj 256 lub 512. My dajemy solidne 128.
-  factor: 5          # Mnożnik dla warstwy FeedForward (d_token * factor)
+  num_layers: 4
+  d_token: 4
+  n_head: 1
+  dim_t: 256
+  factor: 32         
 
 train:
-  batch_size: 32
+  batch_size: 512
   lr: 0.001
-  epochs: 50
+  epochs: 4000
   device: "cuda"
-  output_dir: "checkpoints_const"
+  output_dir: "checkpoints_adult"

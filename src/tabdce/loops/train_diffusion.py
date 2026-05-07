@@ -18,7 +18,6 @@ class ConditionalDenoiser(nn.Module):
         self.num_num = num_num
         self.sum_cat_t = sum_cat_t
         self.drop_prob = drop_prob
-        
         self.cond_num = None
         self.cond_cat_soft = None
         self.cond_y_soft = None
@@ -34,21 +33,32 @@ class ConditionalDenoiser(nn.Module):
         if apply_drop:
             cond_num_used = torch.zeros_like(self.cond_num) if self.cond_num is not None else None
             cond_cat_used = torch.zeros_like(self.cond_cat_soft) if self.cond_cat_soft is not None else None
+            cond_y_used = torch.zeros_like(self.cond_y_soft) if self.cond_y_soft is not None else None
         else:
             cond_num_used = self.cond_num
             cond_cat_used = self.cond_cat_soft
+            cond_y_used = self.cond_y_soft
+            
+
+        if cond_num_used is not None and x_num_t.shape[0] > cond_num_used.shape[0]:
+            K = x_num_t.shape[0] // cond_num_used.shape[0]
+            cond_num_used = cond_num_used.repeat_interleave(K, dim=0)
+            
+            if cond_cat_used is not None:
+                cond_cat_used = cond_cat_used.repeat_interleave(K, dim=0)
+            if cond_y_used is not None:
+                cond_y_used = cond_y_used.repeat_interleave(K, dim=0)
 
         x_num_comb = torch.cat([x_num_t, cond_num_used], dim=1) if cond_num_used is not None else x_num_t
         cat_parts = [x_cat_t_soft]
+        
         if cond_cat_used is not None and cond_cat_used.shape[1] > 0:
             cat_parts.append(cond_cat_used)
-        if self.cond_y_soft is not None:
-            cat_parts.append(self.cond_y_soft)
+        if cond_y_used is not None:
+            cat_parts.append(cond_y_used)
             
         x_cat_comb = torch.cat(cat_parts, dim=1) if len(cat_parts) > 1 else x_cat_t_soft
-        
         out_num_comb, out_cat_comb = self.base_model(x_num_comb, x_cat_comb, t)
-        
         return out_num_comb[:, :self.num_num], out_cat_comb[:, :self.sum_cat_t]
 
     
@@ -104,7 +114,7 @@ def train(cfg: dict, dataset):
         scheduler='power_mean_per_column',
         cat_scheduler='log_linear_per_column',
         noise_dist='uniform_t',
-        edm_params={'sigma_data': 0.5},
+        edm_params={'sigma_data': 1.0},
         sampler_params={
             'stochastic_sampler': True, 
             'second_order_correction': True

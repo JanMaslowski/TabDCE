@@ -53,6 +53,7 @@ def sample_counterfactuals_tabdiff(
         
     return z_norm, z_cat
 
+
 def tabdiff_to_flat_tensor(z_norm, z_cat, cat_cardinalities):
     cat_parts = []
     if z_cat is not None and z_cat.shape[1] > 0:
@@ -124,12 +125,15 @@ def main():
         y_train = y_train[idx]
 
     print("--- Building Train Dataset ---")
+    dpp_m = cfg['dataset'].get('dpp_m', 0.5)
+
     train_dataset = TabularCounterfactualDataset(
         X=X_train_raw, y=y_train, spec=spec, 
         k=cfg['dataset']['k_neighbors'],
         search_method=cfg['dataset'].get('search_method', 'knn'),
         device=device,
-        build_neighbors=True
+        build_neighbors=True,
+        dpp_m=dpp_m
     )
 
     val_dataset = None
@@ -200,13 +204,13 @@ def main():
         cond_y_soft = F.one_hot(y_input_expanded.long(), num_classes=y_classes).float()
 
         trained_diffusion.set_condition(x_num_expanded, cond_cat_soft, cond_y_soft)
+
         z_norm_cf, z_cat_cf = sample_counterfactuals_tabdiff(
             diffusion_model=trained_diffusion,
             x_num_orig=x_num_expanded,
             x_cat_orig=x_cat_expanded,
-            noise_level=0.6 
+            noise_level=0.6  
         )
-        
         final_cfs = tabdiff_to_flat_tensor(z_norm_cf, z_cat_cf, train_dataset.cat_cardinalities)
     
     group_ids = np.arange(len(x_orig_flat)).repeat(N_CF_PER_SAMPLE)
@@ -265,8 +269,10 @@ def main():
     os.makedirs(cfg['train']['output_dir'], exist_ok=True)
     
     torch.save({
-        "metrics": metrics, "config": cfg, 
+        "metrics": metrics, 
+        "config": cfg, 
         "model_state": trained_diffusion.state_dict(),
+        "clf_state": clf_model.state_dict() if clf_model is not None else None,
         "plot_data": {
             "x_orig": x_orig_plot,           
             "x_cf": x_cf_plot,               
@@ -274,7 +280,8 @@ def main():
             "cf_group_ids": group_ids        
         }
     }, save_path)
-    print(f"Saved to: {save_path}")
+    
+    print(f"Saved Checkpoint (Diffusion + Classifier) to: {save_path}")
     wandb.finish()
 
 if __name__ == "__main__":

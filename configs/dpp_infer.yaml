@@ -1,0 +1,20 @@
+project_name: "DICTUM"
+run_name: "DICTUM_dpp_diversity_filtering"
+results_path: "checkpoints_gmc/results_100.csv"
+
+dataset:
+  data_dir: "data/gmc"
+  n_test_samples: 2000
+  n_cf_generated: 100     
+  n_cf_selected: 10       
+  k_neighbors: 15
+
+classifier:
+  train: false           
+  epochs: 0
+  hidden_dim: 32
+
+diffusion:
+  T: 50
+  checkpoint_path: "checkpoints_gmc_BASELINE_DPP/tabdce-diffusion_metrics.pt"
+  noise_level: 0.6
